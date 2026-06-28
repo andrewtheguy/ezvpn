@@ -239,9 +239,10 @@ wrapper** that runs an arbitrary console program as a service. The two common
 choices are [NSSM](https://nssm.cc/) and
 [WinSW](https://github.com/winsw/winsw); NSSM is shown here.
 
-> Prerequisite: the [WinTun](https://www.wintun.net/) driver must be installed
-> (see the project README). The service runs as **LocalSystem** (administrator),
-> which can create the TUN adapter.
+> Prerequisite: `wintun.dll` from [WinTun](https://www.wintun.net/) must be
+> available next to `ezvpn.exe` or in the system `PATH` (see the project
+> README). The service runs as **LocalSystem** (administrator), which can create
+> the TUN adapter.
 
 Install and manage one service per instance (run from an elevated PowerShell):
 

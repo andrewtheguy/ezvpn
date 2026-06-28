@@ -9,8 +9,7 @@ open inbound ports. Relay fallback is used when a direct path is unavailable.
 
 > [!WARNING]
 > While `ezvpn` remains in the `0.0.x` series, there is no backward
-> compatibility between versions. Regenerate server keys and refresh configs on
-> every upgrade.
+> compatibility between versions. Regenerate server keys and refresh configs on every upgrade.
 
 > [!NOTE]
 > Running `ezvpn` requires root/Administrator privileges to create TUN devices
@@ -302,11 +301,11 @@ The runtime directory holds ephemeral state (lock files and control sockets)
 and is machine-global: `/run/ezvpn` on Linux, `/var/run/ezvpn` on macOS, and
 `%ProgramData%\ezvpn` on Windows. Override it with `EZVPN_RUNTIME_DIR`.
 
-The daemon log is kept separately in the persistent log directory: `/var/log/ezvpn`
-on Linux and macOS, and `%ProgramData%\ezvpn\logs` on Windows. Override it with
-`EZVPN_LOG_DIR`. The log is size-capped: at 10 MiB it rotates to a single
-`<name>.log.1` backup (replacing any previous one), so disk use stays bounded at
-roughly 20 MiB per instance. Override the cap (in bytes) with
+On Unix, the daemon log is kept separately in the persistent log directory:
+`/var/log/ezvpn` on Linux and macOS. Override it with `EZVPN_LOG_DIR`. The log
+is size-capped: at 10 MiB it rotates to a single `<name>.log.1` backup
+(replacing any previous one), so disk use stays bounded at roughly 20 MiB per
+instance. Override the cap (in bytes) with
 `EZVPN_LOG_MAX_BYTES`.
 
 Run `status` and `list` as root/Administrator so they resolve the same runtime
@@ -344,6 +343,14 @@ sudo ezvpn client start \
   --route 0.0.0.0/0 \
   --route6 ::/0
 ```
+
+Default routes are installed as split half-routes (`0.0.0.0/1` +
+`128.0.0.0/1`, and `::/1` + `8000::/1`) so the system default route is not
+removed. On Linux and macOS, `ezvpn` also installs host-specific bypass routes
+for iroh underlay addresses that would otherwise be captured by VPN routes.
+That automatic bypass is not implemented on Windows yet; on Windows, avoid
+full-tunnel routes unless you add equivalent host routes yourself or know the
+server/relay underlay addresses are not captured.
 
 ## Protocol, MTU, and GSO
 

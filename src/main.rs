@@ -49,19 +49,19 @@ struct Args {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
-    /// VPN server commands (start, status).
+    /// VPN server commands (start, status, list).
     Server {
         #[command(subcommand)]
         action: ServerAction,
     },
-    /// VPN client commands (start, stop, status).
+    /// VPN client commands (start, stop, status, list).
     Client {
         #[command(subcommand)]
         action: ClientAction,
     },
     /// Generate a new private key for persistent server identity
     ///
-    /// Creates a secret key file that can be used with --secret-file.
+    /// Creates a secret key file for the server config's [iroh] secret_file.
     /// The server's EndpointId remains constant when using the same key.
     GenerateServerKey {
         /// Path where to save the private key file
@@ -83,7 +83,7 @@ enum Command {
     /// Generate a client authentication token
     ///
     /// Tokens are shared with clients for authentication (like API keys).
-    /// Server configures accepted tokens via --auth-tokens or --auth-tokens-file.
+    /// Server configures accepted tokens via [auth] auth_tokens or auth_tokens_file.
     GenerateAuthToken {
         /// Number of tokens to generate (default: 1)
         #[arg(short, long, default_value = "1")]
@@ -210,7 +210,7 @@ enum ClientAction {
         #[arg(long)]
         daemon: bool,
     },
-    /// Stop a running VPN client (sends SIGTERM for a graceful shutdown).
+    /// Stop a running VPN client on Unix (sends SIGTERM for a graceful shutdown).
     Stop {
         /// Instance name of the client to stop (see `client start --instance`).
         #[arg(long, default_value = "default")]
@@ -923,7 +923,7 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
 
     log::info!("VPN Server Node ID: {}", endpoint.id());
     log::info!(
-        "Clients connect with: ezvpn client --server-node-id {} --auth-token <TOKEN> --alpn-token <ALPN_TOKEN>",
+        "Clients connect with: ezvpn client start --server-node-id {} --auth-token <TOKEN> --alpn-token <ALPN_TOKEN>",
         endpoint.id()
     );
 
