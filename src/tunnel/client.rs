@@ -1778,6 +1778,46 @@ mod tests {
         assert!(!mgr.ip_covered_by_vpn_routes("2600:1f13:adc:a001::1".parse().unwrap()));
     }
 
+    /// Regression: `update` is add-only. A route already in `active_routes` must
+    /// survive successive snapshots that omit it (no churn / premature removal);
+    /// it is only dropped when the manager itself is dropped. Locks in the fix
+    /// for the bypass-route add/remove churn.
+    ///
+    /// Snapshots use addresses *not* covered by the manager's VPN routes so
+    /// `update` performs no real OS route operations (covered IPs are filtered
+    /// before `add_bypass_route`); the retained entry is pre-seeded with a
+    /// non-owning guard so the manager can drop without touching the system.
+    #[tokio::test]
+    async fn test_update_is_add_only_keeps_routes_across_snapshots() {
+        let mut mgr = bypass_manager(&["172.31.0.0/16"], &["2600:1f13:adc:a000::/56"]);
+
+        // An already-installed bypass route (e.g. the server's underlay IPv6).
+        let pinned: IpAddr = "2600:1f13:adc:a0b1::1".parse().unwrap();
+        mgr.active_routes
+            .insert(pinned, BypassRouteGuard::test_unowned(pinned));
+
+        // A snapshot that no longer lists the pinned peer (only uncovered IPs,
+        // which are filtered out -> no real route ops): it must stay.
+        mgr.update(HashSet::from(["44.230.20.120".parse().unwrap()]))
+            .await;
+        assert!(
+            mgr.active_routes.contains_key(&pinned),
+            "pinned route removed when absent from snapshot (churn regression)"
+        );
+
+        // An empty snapshot must also not remove it.
+        mgr.update(HashSet::new()).await;
+        assert!(
+            mgr.active_routes.contains_key(&pinned),
+            "pinned route removed on empty snapshot"
+        );
+
+        // Re-listing it must not duplicate or churn it; still exactly one entry.
+        mgr.update(HashSet::from([pinned])).await;
+        assert_eq!(mgr.active_routes.len(), 1);
+        assert!(mgr.active_routes.contains_key(&pinned));
+    }
+
     #[test]
     fn test_backoff_exponential_growth() {
         // Use seeded RNG for deterministic tests
