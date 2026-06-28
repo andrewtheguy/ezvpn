@@ -2100,7 +2100,9 @@ fn parse_macos_route_get(output: &str, peer_ip: IpAddr) -> VpnResult<BypassRoute
 //
 // Windows has no direct `route get <ip>` equivalent, so we drive the in-box
 // `NetTCPIP` PowerShell cmdlets (present on every Windows 8+/Server 2012+, run
-// here via the always-present `powershell.exe` Windows PowerShell 5.1):
+// here via the always-present Windows PowerShell 5.1, resolved by absolute
+// `System32` path rather than `PATH` so a shadowing PowerShell 7 install never
+// shadows it — see `windows_powershell_path`):
 //
 // - `Find-NetRoute -RemoteIPAddress <ip>` runs the kernel's route selection
 //   (longest-prefix + source selection) and returns the chosen `NextHop` and
@@ -2120,10 +2122,28 @@ fn parse_macos_route_get(output: &str, peer_ip: IpAddr) -> VpnResult<BypassRoute
 // All interpolated values are `IpAddr`/`u32`/static literals, so the
 // single-quoted PowerShell strings cannot be broken out of.
 
+/// Absolute path to the in-box Windows PowerShell 5.1 executable.
+///
+/// Resolving by bare name (`powershell`) goes through `PATH`, which on many
+/// machines is shadowed by PowerShell 7 (`pwsh.exe` symlinked/copied as
+/// `powershell.exe`), a Microsoft Store alias, or another shim. The NetTCPIP
+/// scripts here are written for, and verified against, the always-present
+/// Windows PowerShell 5.1, so we pin to its fixed `System32` location under the
+/// real Windows directory (`%SystemRoot%`, fallback `C:\Windows`). This is the
+/// native-bitness copy; a 64-bit process reaches it directly and a 32-bit
+/// process is redirected to the matching `SysWOW64` copy, both of which ship the
+/// NetTCPIP module.
+#[cfg(target_os = "windows")]
+fn windows_powershell_path() -> std::path::PathBuf {
+    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    std::path::Path::new(&system_root)
+        .join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
 /// Run a PowerShell script via the in-box `powershell.exe` (async).
 #[cfg(target_os = "windows")]
 async fn run_powershell(script: &str) -> VpnResult<std::process::Output> {
-    Command::new("powershell")
+    Command::new(windows_powershell_path())
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .await
@@ -2133,7 +2153,7 @@ async fn run_powershell(script: &str) -> VpnResult<std::process::Output> {
 /// Run a PowerShell script via the in-box `powershell.exe` (blocking, for Drop).
 #[cfg(target_os = "windows")]
 fn run_powershell_sync(script: &str) -> std::io::Result<std::process::Output> {
-    std::process::Command::new("powershell")
+    std::process::Command::new(windows_powershell_path())
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
 }
