@@ -1,0 +1,915 @@
+//! ezvpn
+//!
+//! IP-over-QUIC VPN tunnel via iroh P2P connections.
+//! Uses ezvpn auth tokens for access control and TLS 1.3/QUIC for encryption.
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("ezvpn only supports Linux, macOS, and Windows");
+
+mod auth;
+mod config;
+mod control;
+mod error;
+mod lock;
+mod net;
+mod secret;
+mod transport;
+mod tunnel;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use ipnet::{Ipv4Net, Ipv6Net};
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
+
+use crate::config::file_config::{
+    ResolvedVpnClientConfig, ResolvedVpnServerConfig, VpnClientConfig as TomlClientConfig,
+    VpnClientConfigBuilder, VpnServerConfig as TomlServerConfig, expand_tilde,
+    load_vpn_client_config, load_vpn_server_config,
+};
+use crate::lock::LockRole;
+use crate::transport::endpoint::{create_client_endpoint, create_server_endpoint, load_secret};
+// Runtime config types (different from the TOML config types in config::file_config)
+use crate::config::{VpnClientConfig, VpnServerConfig};
+use crate::tunnel::signaling::build_vpn_alpn;
+use crate::tunnel::{VpnClient, VpnServer};
+
+#[derive(Parser)]
+#[command(name = "ezvpn")]
+#[command(version)]
+#[command(about = "IP-over-QUIC VPN tunnel via iroh P2P")]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+// This enum is parsed once at startup; the size disparity between variants is
+// irrelevant here, and boxing fields would fight the clap derive macro.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+enum Command {
+    /// VPN server commands (start, status).
+    Server {
+        #[command(subcommand)]
+        action: ServerAction,
+    },
+    /// VPN client commands (start, stop, status).
+    Client {
+        #[command(subcommand)]
+        action: ClientAction,
+    },
+    /// Generate a new private key for persistent server identity
+    ///
+    /// Creates a secret key file that can be used with --secret-file.
+    /// The server's EndpointId remains constant when using the same key.
+    GenerateServerKey {
+        /// Path where to save the private key file
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Overwrite existing file if it exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show the server's public EndpointId derived from a private key
+    ///
+    /// Clients use this EndpointId with --server-node-id to connect.
+    ShowServerId {
+        /// Path to the private key file
+        #[arg(short, long)]
+        secret_file: PathBuf,
+    },
+    /// Generate a client authentication token
+    ///
+    /// Tokens are shared with clients for authentication (like API keys).
+    /// Server configures accepted tokens via --auth-tokens or --auth-tokens-file.
+    GenerateAuthToken {
+        /// Number of tokens to generate (default: 1)
+        #[arg(short, long, default_value = "1")]
+        count: usize,
+    },
+    /// Generate an ALPN token (shared pre-handshake "knock" secret)
+    ///
+    /// The same ALPN token must be configured on the server and every client.
+    /// It is embedded into the iroh ALPN value, so a peer that doesn't know it
+    /// fails to connect at the QUIC handshake before any stream is opened.
+    GenerateAlpnToken {
+        /// Number of tokens to generate (default: 1)
+        #[arg(short, long, default_value = "1")]
+        count: usize,
+    },
+}
+
+/// Server subcommands.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+enum ServerAction {
+    /// Start the VPN server (accepts connections and assigns IPs).
+    ///
+    /// Requires a config file. Use -c to specify a path or --default-config for
+    /// ~/.config/ezvpn/vpn_server.toml. See vpn_server.toml.example for format.
+    Start {
+        /// Config file path (required unless --default-config is used)
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+
+        /// Use default config path (~/.config/ezvpn/vpn_server.toml)
+        #[arg(long)]
+        default_config: bool,
+    },
+    /// Query the status of the running VPN server on this host.
+    Status {
+        /// Output the raw status snapshot as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List VPN server instances on this host.
+    List {
+        /// Output the raw instance list as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Client subcommands.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+enum ClientAction {
+    /// Start the VPN client (connects to server and establishes tunnel).
+    Start {
+        /// Config file path
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+
+        /// Use default config path (~/.config/ezvpn/vpn_client.toml)
+        #[arg(long)]
+        default_config: bool,
+
+        /// EndpointId of the VPN server to connect to
+        #[arg(short = 'n', long)]
+        server_node_id: Option<String>,
+
+        /// Custom relay server URL(s) for failover
+        #[arg(long = "relay-url")]
+        relay_urls: Vec<String>,
+
+        /// Custom DNS server URL for peer discovery
+        #[arg(long)]
+        dns_server: Option<String>,
+
+        /// Authentication token to send to server
+        #[arg(long)]
+        auth_token: Option<String>,
+
+        /// Path to file containing authentication token
+        #[arg(long)]
+        auth_token_file: Option<PathBuf>,
+
+        /// ALPN token (shared pre-handshake "knock" secret; must match the server)
+        #[arg(long)]
+        alpn_token: Option<String>,
+
+        /// Path to file containing the ALPN token
+        #[arg(long)]
+        alpn_token_file: Option<PathBuf>,
+
+        /// Additional IPv4 route CIDRs through the VPN (optional, repeatable).
+        /// The VPN subnet is always routed by default.
+        /// Full tunnel: --route 0.0.0.0/0
+        /// Split tunnel: --route 192.168.1.0/24 --route 10.0.0.0/8
+        #[arg(long = "route")]
+        routes: Vec<String>,
+
+        /// IPv6 route CIDRs through the VPN (optional, repeatable)
+        /// Full tunnel: --route6 ::/0
+        /// Split tunnel: --route6 fd00::/64
+        #[arg(long = "route6")]
+        routes6: Vec<String>,
+
+        /// Enable auto-reconnect (override config's auto_reconnect = false)
+        #[arg(long, conflicts_with = "no_auto_reconnect")]
+        auto_reconnect: bool,
+
+        /// Disable auto-reconnect (exit on first disconnection)
+        #[arg(long, conflicts_with = "auto_reconnect")]
+        no_auto_reconnect: bool,
+
+        /// Maximum reconnect attempts (unlimited if not specified)
+        #[arg(long, conflicts_with = "no_auto_reconnect")]
+        max_reconnect_attempts: Option<NonZeroU32>,
+
+        /// Instance name. Scopes the lock and status socket so multiple clients
+        /// can run at once. Allowed: ASCII letters, digits, underscores.
+        #[arg(long, default_value = "default")]
+        instance: String,
+
+        /// Run in the background as a daemon (Unix only). Logs are written to
+        /// <runtime_dir>/ezvpn-client-<instance>.log.
+        #[arg(long)]
+        daemon: bool,
+    },
+    /// Stop a running VPN client (sends SIGTERM for a graceful shutdown).
+    Stop {
+        /// Instance name of the client to stop (see `client start --instance`).
+        #[arg(long, default_value = "default")]
+        instance: String,
+    },
+    /// Query the status of the running VPN client on this host.
+    Status {
+        /// Output the raw status snapshot as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Instance name of the client to query (see `client start --instance`).
+        #[arg(long, default_value = "default")]
+        instance: String,
+    },
+    /// List VPN client instances on this host.
+    List {
+        /// Output the raw instance list as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Resolve VPN server config from CLI and/or config file.
+fn resolve_server_config(
+    config: Option<PathBuf>,
+    default_config: bool,
+) -> Result<(Option<TomlServerConfig>, bool)> {
+    if let Some(path) = config {
+        let cfg = load_vpn_server_config(Some(path.as_path()))?;
+        Ok((Some(cfg), true))
+    } else if default_config {
+        let cfg = load_vpn_server_config(None)?;
+        Ok((Some(cfg), true))
+    } else {
+        Ok((None, false))
+    }
+}
+
+/// Resolve VPN client config from CLI and/or config file.
+fn resolve_client_config(
+    config: Option<PathBuf>,
+    default_config: bool,
+) -> Result<(Option<TomlClientConfig>, bool)> {
+    if let Some(path) = config {
+        let cfg = load_vpn_client_config(Some(path.as_path()))?;
+        Ok((Some(cfg), true))
+    } else if default_config {
+        let cfg = load_vpn_client_config(None)?;
+        Ok((Some(cfg), true))
+    } else {
+        Ok((None, false))
+    }
+}
+
+/// Resolve and validate the required ALPN token from an inline value or a file.
+///
+/// The ALPN token is a shared pre-handshake "knock" secret that must match on
+/// the server and every client. Exactly one source must be provided.
+fn resolve_alpn_token(inline: Option<&str>, file: Option<&Path>) -> Result<String> {
+    if let Some(token) = inline {
+        auth::validate_alpn_token(token).context("Invalid ALPN token")?;
+        Ok(token.to_string())
+    } else if let Some(path) = file {
+        auth::load_alpn_token_from_file(path).context("Failed to load ALPN token from file")
+    } else {
+        anyhow::bail!(
+            "An ALPN token is required.\n\
+             Generate one with: ezvpn generate-alpn-token\n\
+             Then set 'alpn_token' (or 'alpn_token_file') in the config file, \
+             or pass --alpn-token / --alpn-token-file (client)."
+        );
+    }
+}
+
+/// Log the binary name and version at tunnel startup (server/client only).
+fn log_version() {
+    log::info!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+}
+
+/// Install the global logger. Must be called exactly once per process; for the
+/// client daemon this happens *after* the fork so output lands in the log file.
+fn init_logger() {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,iroh=warn,tracing=warn"),
+    )
+    .init();
+}
+
+/// Build the multi-threaded Tokio runtime used by the async commands. Built
+/// after any daemonization fork — a runtime cannot survive `fork()`.
+fn build_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(Into::into)
+}
+
+/// Default daemon log-file path for a client instance (absolute; in the runtime
+/// dir, so it survives the daemon's `chdir("/")`).
+fn client_log_path(instance: &str) -> PathBuf {
+    lock::runtime_dir().join(format!(
+        "{}.log",
+        lock::runtime_base_name(LockRole::Client, instance)
+    ))
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    match args.command {
+        // `client start` is the only command that may daemonize. Its whole
+        // validation phase runs synchronously here so config/flag/path errors
+        // surface in the foreground, and the fork (when `--daemon`) happens
+        // BEFORE the Tokio runtime is built — a runtime cannot survive fork().
+        Command::Client {
+            action:
+                ClientAction::Start {
+                    config,
+                    default_config,
+                    server_node_id,
+                    relay_urls,
+                    dns_server,
+                    auth_token,
+                    auth_token_file,
+                    alpn_token,
+                    alpn_token_file,
+                    routes,
+                    routes6,
+                    auto_reconnect,
+                    no_auto_reconnect,
+                    max_reconnect_attempts,
+                    instance,
+                    daemon,
+                },
+        } => {
+            lock::validate_instance_name(&instance)?;
+            let mut resolved = prepare_client_start(
+                config,
+                default_config,
+                server_node_id,
+                relay_urls,
+                dns_server,
+                auth_token,
+                auth_token_file,
+                alpn_token,
+                alpn_token_file,
+                routes,
+                routes6,
+                auto_reconnect,
+                no_auto_reconnect,
+                max_reconnect_attempts,
+            )?;
+
+            let daemon_log = if daemon {
+                // The daemon does chdir("/"), which breaks cwd-relative paths.
+                // Resolve the files the client reads post-fork to absolute now;
+                // this also surfaces missing-file errors in the foreground.
+                canonicalize_client_paths(&mut resolved)?;
+                let log_path = client_log_path(&instance);
+                eprintln!("ezvpn: daemonizing; logs at {}", log_path.display());
+                daemonize_client(&log_path)?;
+                Some(log_path.display().to_string())
+            } else {
+                None
+            };
+
+            init_logger();
+            log_version();
+            build_runtime()?.block_on(run_vpn_client(resolved, &instance, daemon_log))
+        }
+
+        // Synchronous commands: no Tokio runtime is ever created.
+        Command::GenerateServerKey { output, force } => {
+            init_logger();
+            secret::generate_secret(expand_tilde(&output), force)
+        }
+        Command::ShowServerId { secret_file } => {
+            init_logger();
+            secret::show_id(expand_tilde(&secret_file))
+        }
+        Command::GenerateAuthToken { count } => {
+            init_logger();
+            for _ in 0..count {
+                println!("{}", auth::generate_token());
+            }
+            Ok(())
+        }
+        Command::GenerateAlpnToken { count } => {
+            init_logger();
+            for _ in 0..count {
+                println!("{}", auth::generate_alpn_token());
+            }
+            Ok(())
+        }
+
+        // Everything else is async but never daemonizes: run on a fresh runtime.
+        command => {
+            init_logger();
+            build_runtime()?.block_on(run_async(command))
+        }
+    }
+}
+
+/// Dispatch the async commands that do not daemonize, on the current runtime.
+async fn run_async(command: Command) -> Result<()> {
+    match command {
+        Command::Server {
+            action:
+                ServerAction::Start {
+                    config,
+                    default_config,
+                },
+        } => {
+            log_version();
+            // Config file is required for VPN server
+            if config.is_none() && !default_config {
+                anyhow::bail!(
+                    "VPN server requires a config file.\n\
+                     Use -c <FILE> or --default-config (~/.config/ezvpn/vpn_server.toml)\n\
+                     See vpn_server.toml.example for format."
+                );
+            }
+
+            // Load and validate config file
+            let (cfg, _from_file) = resolve_server_config(config, default_config)?;
+            let cfg = cfg
+                .expect("resolve_server_config returns Some when config or default_config is set");
+            cfg.validate()?;
+
+            // Build resolved config from config file
+            let resolved = ResolvedVpnServerConfig::from_config(&cfg)?;
+
+            run_vpn_server(resolved).await
+        }
+        Command::Server {
+            action: ServerAction::Status { json },
+        } => show_status(LockRole::Server, json, "default").await,
+        Command::Server {
+            action: ServerAction::List { json },
+        } => show_list(LockRole::Server, json).await,
+        Command::Client {
+            action: ClientAction::Stop { instance },
+        } => stop_client(&instance).await,
+        Command::Client {
+            action: ClientAction::Status { json, instance },
+        } => {
+            lock::validate_instance_name(&instance)?;
+            show_status(LockRole::Client, json, &instance).await
+        }
+        Command::Client {
+            action: ClientAction::List { json },
+        } => show_list(LockRole::Client, json).await,
+        // Handled synchronously in main().
+        Command::Client {
+            action: ClientAction::Start { .. },
+        }
+        | Command::GenerateServerKey { .. }
+        | Command::ShowServerId { .. }
+        | Command::GenerateAuthToken { .. }
+        | Command::GenerateAlpnToken { .. } => {
+            unreachable!("dispatched synchronously in main()")
+        }
+    }
+}
+
+/// Synchronous validation/build phase for `client start`. Runs before any
+/// daemonization so config and flag errors surface in the foreground.
+#[allow(clippy::too_many_arguments)]
+fn prepare_client_start(
+    config: Option<PathBuf>,
+    default_config: bool,
+    server_node_id: Option<String>,
+    relay_urls: Vec<String>,
+    dns_server: Option<String>,
+    auth_token: Option<String>,
+    auth_token_file: Option<PathBuf>,
+    alpn_token: Option<String>,
+    alpn_token_file: Option<PathBuf>,
+    routes: Vec<String>,
+    routes6: Vec<String>,
+    auto_reconnect: bool,
+    no_auto_reconnect: bool,
+    max_reconnect_attempts: Option<NonZeroU32>,
+) -> Result<ResolvedVpnClientConfig> {
+    // Load config file if specified
+    let (cfg, from_file) = resolve_client_config(config, default_config)?;
+    if from_file && let Some(ref c) = cfg {
+        c.validate()?;
+    }
+
+    // Convert mutually exclusive flags to Option<bool>
+    // --auto-reconnect => Some(true), --no-auto-reconnect => Some(false), neither => None
+    assert!(
+        !(auto_reconnect && no_auto_reconnect),
+        "both --auto-reconnect and --no-auto-reconnect were set (clap conflicts_with should prevent this)"
+    );
+    let auto_reconnect_opt = match (auto_reconnect, no_auto_reconnect) {
+        (true, false) => Some(true),    // --auto-reconnect: enable reconnect
+        (false, true) => Some(false),   // --no-auto-reconnect: disable reconnect
+        (false, false) => None,         // neither: use config/default
+        (true, true) => unreachable!(), // guarded by assert above
+    };
+
+    // Build resolved config: defaults -> config file -> CLI
+    VpnClientConfigBuilder::new()
+        .apply_defaults()
+        .apply_config(cfg.as_ref())
+        .apply_cli(
+            server_node_id,
+            auth_token,
+            auth_token_file.map(|p| expand_tilde(&p)),
+            alpn_token,
+            alpn_token_file.map(|p| expand_tilde(&p)),
+            routes,
+            routes6,
+            relay_urls,
+            dns_server,
+            auto_reconnect_opt,
+            max_reconnect_attempts,
+        )
+        .build()
+}
+
+/// Resolve the cwd-relative files the client reads after daemonizing to
+/// absolute paths (the daemon does `chdir("/")`). Errors are reported in the
+/// foreground before the fork.
+fn canonicalize_client_paths(resolved: &mut ResolvedVpnClientConfig) -> Result<()> {
+    for (field, slot) in [
+        ("auth token file", &mut resolved.auth_token_file),
+        ("ALPN token file", &mut resolved.alpn_token_file),
+    ] {
+        if let Some(path) = slot.as_ref() {
+            let abs = std::fs::canonicalize(path)
+                .with_context(|| format!("resolving {field} {}", path.display()))?;
+            *slot = Some(abs);
+        }
+    }
+    Ok(())
+}
+
+/// Fork the current process into the background as a daemon (Unix only). Must
+/// be called before the Tokio runtime is built. Sets `chdir("/")` and redirects
+/// stdout/stderr to `log_path`; the parent process exits inside `start()`.
+#[cfg(unix)]
+fn daemonize_client(log_path: &Path) -> Result<()> {
+    // The log lives in the runtime dir, which may not exist on first run.
+    lock::ensure_runtime_dir().context("creating runtime directory for daemon log")?;
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("opening daemon log file {}", log_path.display()))?;
+    let err = out
+        .try_clone()
+        .context("cloning daemon log file handle")?;
+    daemonix::Daemonize::new()
+        .working_directory("/")
+        .stdout(out)
+        .stderr(err)
+        .start()
+        .context("failed to daemonize")?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn daemonize_client(_log_path: &Path) -> Result<()> {
+    anyhow::bail!("--daemon is only supported on Unix");
+}
+
+/// Wait for a shutdown signal (SIGTERM/SIGINT on Unix, Ctrl-C elsewhere).
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Stop a running VPN client by signaling its process with SIGTERM. The client
+/// catches the signal and shuts down gracefully (releasing its lock, removing
+/// the status socket, and tearing down the TUN device).
+#[cfg(unix)]
+async fn stop_client(instance: &str) -> Result<()> {
+    lock::validate_instance_name(instance)?;
+
+    // Confirm an instance is actually serving before signaling a PID.
+    if control::query_status(LockRole::Client, instance).await?.is_none() {
+        println!("ezvpn client (instance {instance}) is not running.");
+        return Ok(());
+    }
+
+    let pid = lock::read_instance_pid(LockRole::Client, instance)?
+        .context("could not determine client PID from lock file")?;
+
+    // SAFETY: a plain SIGTERM to a PID we just confirmed is a live instance.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to signal client pid {pid}"));
+    }
+    println!("Sent stop signal to client (instance {instance}, pid {pid}).");
+
+    // Best-effort: wait briefly for the process to exit.
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if control::query_status(LockRole::Client, instance).await?.is_none() {
+            println!("Client stopped.");
+            return Ok(());
+        }
+    }
+    println!("Stop signal sent; client did not exit within 5s (still shutting down?).");
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn stop_client(_instance: &str) -> Result<()> {
+    anyhow::bail!("client stop is only supported on Unix");
+}
+
+/// Query and print the status of a running server/client via its control socket.
+async fn show_status(role: LockRole, json: bool, instance: &str) -> Result<()> {
+    let label = match role {
+        LockRole::Server => "server",
+        LockRole::Client => "client",
+    };
+    match control::query_status(role, instance).await? {
+        Some(snapshot) => {
+            control::print_status(&snapshot, json)?;
+            Ok(())
+        }
+        None => {
+            if json {
+                println!("{{\"state\":\"not_running\"}}");
+            } else {
+                println!("ezvpn {label} is not running.");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// List instances discovered on this host (one line each, or JSON).
+async fn show_list(role: LockRole, json: bool) -> Result<()> {
+    let instances = control::list_instances(role).await?;
+    control::print_instances(role, &instances, json)?;
+    Ok(())
+}
+
+/// Run VPN server.
+async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
+    // Parse IPv4 network CIDR (optional, for IPv6-only servers)
+    let network: Option<Ipv4Net> = resolved
+        .network
+        .as_ref()
+        .map(|n| n.parse())
+        .transpose()
+        .context("Invalid VPN network CIDR")?;
+
+    // Parse server IP if provided
+    let server_ip: Option<Ipv4Addr> = resolved
+        .server_ip
+        .as_ref()
+        .map(|ip_str| ip_str.parse())
+        .transpose()
+        .context("Invalid server IP address")?;
+
+    // Parse IPv6 network CIDR (optional, for dual-stack)
+    let network6: Option<Ipv6Net> = resolved
+        .network6
+        .as_ref()
+        .map(|n| n.parse())
+        .transpose()
+        .context("Invalid IPv6 VPN network CIDR")?;
+
+    // Parse server IPv6 if provided
+    let server_ip6: Option<Ipv6Addr> = resolved
+        .server_ip6
+        .as_ref()
+        .map(|ip_str| ip_str.parse())
+        .transpose()
+        .context("Invalid server IPv6 address")?;
+
+    // Load and validate auth tokens (required for VPN server)
+    let valid_tokens =
+        auth::load_auth_tokens(&resolved.auth_tokens, resolved.auth_tokens_file.as_deref())
+            .context("Failed to load authentication tokens")?;
+
+    if valid_tokens.is_empty() {
+        anyhow::bail!(
+            "VPN server requires at least one authentication token.\n\
+             Generate one with: ezvpn generate-auth-token\n\
+             Then add to config file: auth_tokens = [\"<TOKEN>\"]"
+        );
+    }
+
+    log::info!("Loaded {} authentication token(s)", valid_tokens.len());
+
+    // Load and validate the ALPN token (required - the pre-handshake "knock" secret)
+    let alpn_token = resolve_alpn_token(
+        resolved.alpn_token.as_deref(),
+        resolved.alpn_token_file.as_deref(),
+    )?;
+    let alpn = build_vpn_alpn(&alpn_token);
+
+    // Load secret key for persistent iroh identity (required for server)
+    let secret_key = if let Some(ref path) = resolved.secret_file {
+        load_secret(path).context("Failed to load secret key")?
+    } else {
+        anyhow::bail!(
+            "VPN server requires a secret key file for persistent identity.\n\
+             Generate one with: ezvpn generate-server-key -o <FILE>\n\
+             Then add to config file: secret_file = \"<FILE>\""
+        );
+    };
+
+    // Create VPN server config
+    let config = VpnServerConfig {
+        network,
+        network6,
+        server_ip,
+        server_ip6,
+        ip6_strategy: resolved.ip6_strategy,
+        mtu: resolved.mtu,
+        max_clients: 254,
+        auth_tokens: Some(valid_tokens),
+        drop_on_full: resolved.drop_on_full,
+        client_channel_size: resolved.client_channel_size,
+        tun_writer_channel_size: resolved.tun_writer_channel_size,
+        disable_spoofing_check: resolved.disable_spoofing_check,
+    };
+
+    // Create iroh endpoint for signaling.
+    // relay_only is hardcoded to false: VPN traffic is high-bandwidth and latency-sensitive,
+    // making relay-only impractical. Direct P2P is strongly preferred; relay is only used
+    // as automatic fallback when direct connection fails.
+    let endpoint = create_server_endpoint(
+        &resolved.relay_urls,
+        false, // relay_only - direct P2P preferred for VPN performance
+        Some(secret_key),
+        resolved.dns_server.as_deref(),
+        &alpn,
+        &resolved.transport,
+    )
+    .await
+    .context("Failed to create iroh endpoint")?;
+
+    log::info!("VPN Server Node ID: {}", endpoint.id());
+    log::info!(
+        "Clients connect with: ezvpn client --server-node-id {} --auth-token <TOKEN> --alpn-token <ALPN_TOKEN>",
+        endpoint.id()
+    );
+
+    // Create and run VPN server
+    let server = VpnServer::new(config, endpoint.id(), &resolved.transport)
+        .await
+        .context("Failed to create VPN server")?;
+
+    server
+        .run(endpoint)
+        .await
+        .map_err(|e| anyhow::anyhow!("VPN server error: {}", e))
+}
+
+/// Run VPN client.
+async fn run_vpn_client(
+    resolved: ResolvedVpnClientConfig,
+    instance: &str,
+    daemon_log: Option<String>,
+) -> Result<()> {
+    // Load auth token (from CLI or file)
+    let token = if let Some(ref token) = resolved.auth_token {
+        auth::validate_token(token).context("Invalid authentication token from CLI")?;
+        token.clone()
+    } else if let Some(ref path) = resolved.auth_token_file {
+        auth::load_auth_token_from_file(path)
+            .context("Failed to load authentication token from file")?
+    } else {
+        anyhow::bail!(
+            "VPN client requires an authentication token.\n\
+             Use --auth-token <TOKEN> or --auth-token-file <FILE>"
+        );
+    };
+
+    // Parse IPv4 routes (optional - VPN subnet is always routed by default)
+    let parsed_routes: Vec<Ipv4Net> = resolved
+        .routes
+        .iter()
+        .map(|r| r.parse::<Ipv4Net>())
+        .collect::<Result<Vec<_>, _>>()
+        .context("Invalid route CIDR (e.g., 192.168.1.0/24)")?;
+
+    // Parse IPv6 routes (optional)
+    let parsed_routes6: Vec<Ipv6Net> = resolved
+        .routes6
+        .iter()
+        .map(|r| r.parse::<Ipv6Net>())
+        .collect::<Result<Vec<_>, _>>()
+        .context("Invalid route6 CIDR (e.g., ::/0 or fd00::/64)")?;
+
+    log::info!("Routing {} IPv4 CIDR(s) through VPN:", parsed_routes.len());
+    for route in &parsed_routes {
+        log::info!("  {}", route);
+    }
+    if !parsed_routes6.is_empty() {
+        log::info!("Routing {} IPv6 CIDR(s) through VPN:", parsed_routes6.len());
+        for route6 in &parsed_routes6 {
+            log::info!("  {}", route6);
+        }
+    }
+
+    // Resolve and validate the ALPN token (required), then build the ALPN value
+    let alpn_token = resolve_alpn_token(
+        resolved.alpn_token.as_deref(),
+        resolved.alpn_token_file.as_deref(),
+    )?;
+    let alpn = build_vpn_alpn(&alpn_token);
+
+    // Create VPN client config
+    let config = VpnClientConfig {
+        server_node_id: resolved.server_node_id.clone(),
+        auth_token: Some(token),
+        alpn,
+        routes: parsed_routes,
+        routes6: parsed_routes6,
+    };
+
+    // Create iroh endpoint for signaling (ephemeral identity).
+    // relay_only is hardcoded to false: VPN traffic is high-bandwidth and latency-sensitive,
+    // making relay-only impractical. Direct P2P is strongly preferred; relay is only used
+    // as automatic fallback when direct connection fails.
+    let endpoint = create_client_endpoint(
+        &resolved.relay_urls,
+        false, // relay_only - direct P2P preferred for VPN performance
+        resolved.dns_server.as_deref(),
+        None, // No persistent secret key - ephemeral
+    )
+    .await
+    .context("Failed to create iroh endpoint")?;
+
+    log::info!("VPN Client Node ID: {}", endpoint.id());
+
+    // Create VPN client
+    let client = VpnClient::new(config, instance)
+        .map_err(|e| anyhow::anyhow!("Failed to create VPN client: {}", e))?;
+
+    // Surface the daemon log-file path through the status socket (None when
+    // running in the foreground).
+    client.status_handle().set_log_file(daemon_log);
+
+    // Spawn the status control-socket listener. It outlives individual
+    // connections (e.g. across reconnects); the guard stops it when we return.
+    let status_handle = client.status_handle();
+    let _status_listener =
+        control::spawn_status_listener(LockRole::Client, instance, move || {
+            status_handle.snapshot()
+        });
+    match &_status_listener {
+        Ok(_) => log::info!(
+            "Status control socket ready (ezvpn client status --instance {instance})"
+        ),
+        Err(e) => log::warn!("Status control socket unavailable: {e}"),
+    }
+    let _status_listener = _status_listener.ok();
+
+    // Connect with or without auto-reconnect. Race against a shutdown signal so
+    // SIGTERM (e.g. `ezvpn client stop`) or Ctrl-C returns cleanly, letting
+    // the guards/Drop tear down the lock, status socket, and TUN device.
+    let run = async {
+        if resolved.auto_reconnect {
+            client
+                .run_with_reconnect(
+                    &endpoint,
+                    &resolved.relay_urls,
+                    resolved.max_reconnect_attempts,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("VPN connection error: {}", e))
+        } else {
+            log::info!("Auto-reconnect disabled, single connection attempt");
+            client
+                .connect(&endpoint, &resolved.relay_urls)
+                .await
+                .map_err(|e| anyhow::anyhow!("VPN connection error: {}", e))
+        }
+    };
+
+    tokio::select! {
+        res = run => res,
+        _ = shutdown_signal() => {
+            log::info!("Received shutdown signal, stopping VPN client");
+            Ok(())
+        }
+    }
+}

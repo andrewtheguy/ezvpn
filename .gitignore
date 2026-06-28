@@ -1,0 +1,58 @@
+# .gitignore for Rust projects
+
+# Compiled output
+target/
+
+# Ignore nested target dirs in workspaces
+**/target/
+
+# Build folders used by some tools
+build/
+
+
+# Backup and temp files
+*~
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Editor directories and files
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
+
+# Emacs
+.#*
+
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs
+*.log
+
+# Node dependencies (if frontend code exists)
+node_modules/
+
+# Environment files
+.env
+
+# Rust analyzer
+.rust-analyzer/
+
+# Certificates and keys
+*.pem
+*.key
+
+wg-test/
+
+tmp/
+
+test-scripts/.tunnel_keys
+test-scripts/.keys/
+.claude/

@@ -1,0 +1,259 @@
+# ezvpn server configuration example
+#
+# Usage: ezvpn server run -c vpn_server.toml
+#        ezvpn server run --default-config
+#
+# Server runtime settings are read from this config file. The server CLI only
+# selects the config path (-c or --default-config).
+#
+# Config is grouped by purpose:
+#   [network] - VPN tunnel addressing (the VPN itself)
+#   [auth]    - client authentication tokens
+#   top-level - server runtime behavior (buffering, backpressure, security)
+#   [iroh]    - iroh transport: identity, ALPN, relays, discovery, QUIC tuning
+
+# Required: validates config matches CLI command
+role = "vpnserver"
+
+[network]
+# ============================================================================
+# VPN Network Configuration
+# ============================================================================
+# At least one of 'network' (IPv4) or 'network6' (IPv6) is REQUIRED.
+# You can configure:
+#   - IPv4-only:   Set 'network' only
+#   - IPv6-only:   Set 'network6' only
+#   - Dual-stack:  Set both 'network' and 'network6'
+
+# IPv4 VPN network CIDR (optional if network6 is set)
+# Clients will be assigned IPs from this network
+network = "10.0.0.0/24"
+
+# Server's VPN IP address (optional, defaults to first IP in network)
+# This becomes the gateway for connected clients
+# server_ip = "10.0.0.1"
+
+# ----------------------------------------------------------------------------
+# IPv6 Configuration (Optional for Dual-Stack or IPv6-only)
+# ----------------------------------------------------------------------------
+# Enable IPv6 alongside IPv4 (dual-stack) or as the only address family (IPv6-only).
+# When both network and network6 are set, clients receive addresses from both.
+
+# IPv6 VPN network CIDR (required for dual-stack or IPv6-only)
+# Clients will be assigned IPs from this network (one /128 per client)
+# network6 = "fd00::/64"
+
+# IPv6 address-assignment strategy (optional, default: "sequential")
+#
+# "sequential" (default): Server gets the first IP (e.g., fd00::1), clients
+#                         get fd00::2, fd00::3, ... in connection order.
+#
+# "node-id":              Stateless deterministic addressing. Each client's
+#                         64-bit host suffix is derived (SHA-256) from its
+#                         iroh node id, so a client always gets the same
+#                         address across reconnects and server restarts —
+#                         no allocation state is kept. The server's address
+#                         is likewise derived from the server's node id.
+#                         Requires 'network6' of /64 or wider (prefix <= 64)
+#                         and cannot be combined with 'server_ip6' (the
+#                         server address is derived, not configured).
+# ip6_strategy = "node-id"
+
+# Server's IPv6 VPN address (optional, defaults to first IP in network6)
+# This becomes the IPv6 gateway for connected clients
+# NOTE: Only valid with the default "sequential" strategy; with "node-id"
+# the server address is derived from the server's node id.
+# server_ip6 = "fd00::1"
+
+# ----------------------------------------------------------------------------
+# IPv6-only Example Configuration
+# ----------------------------------------------------------------------------
+# For an IPv6-only VPN server, comment out 'network' above and enable:
+#
+# # network = "10.0.0.0/24"  # Comment out or remove for IPv6-only
+# network6 = "fd00::/64"
+# ip6_strategy = "node-id"   # or omit for sequential (server_ip6 allowed then)
+
+# MTU for VPN packets (576-9216, default: 1440)
+# Lower values may help with fragmentation issues.
+# NOTE: The MTU is dictated to clients during the handshake; clients do not
+# configure it themselves. All clients share this one value.
+#
+# DATAGRAM CAP: the data path is unreliable QUIC datagrams, each bounded by the
+# connection's max_datagram_size. The initial QUIC path MTU is 1452 (IPv6-safe
+# max for a 1500-byte Ethernet path), giving a max_datagram_size of ~1416, so the
+# effective TUN MTU is clamped to a datagram-safe ceiling of ~1400 regardless of a
+# larger value here, and the per-client advertised MTU is further clamped to that
+# connection's datagram size. Configuring a jumbo MTU has no effect: a single
+# datagram cannot exceed the QUIC datagram size, so large packets would simply
+# not fit (and are dropped).
+#
+# PATH ASSUMPTION: ~1400 assumes a standard >=1500-MTU path (LAN / most
+# broadband). On a smaller or tunnel-in-tunnel path, QUIC discovery lowers the
+# live path MTU but the inner TUN MTU is fixed for the connection's life, so set
+# this lower for those deployments. For IPv6 keep the effective MTU >= 1280.
+# mtu = 1440   # default (clamped to the datagram-safe ceiling at runtime)
+
+[auth]
+# ============================================================================
+# Authentication (REQUIRED)
+# ============================================================================
+# At least one authentication method is required.
+# Clients must provide one of these tokens to connect.
+#
+# Token format: exactly 47 characters (`v` + 46 Base64URL chars, no padding)
+# Generate with: ezvpn generate-auth-token
+
+# Inline tokens (for testing; prefer auth_tokens_file in production)
+# NOTE: Use either auth_tokens OR auth_tokens_file, not both.
+auth_tokens = ["<YOUR_AUTH_TOKEN>"]  # Replace with real token from generate-auth-token
+
+# Or use a file containing tokens (one per line, # comments allowed)
+# NOTE: Use either auth_tokens OR auth_tokens_file, not both.
+# auth_tokens_file = "./vpn-tokens.txt"
+
+# ============================================================================
+# Server Runtime (Optional, top-level)
+# ============================================================================
+# These are server-process behavior knobs, not iroh transport settings.
+
+# Performance Tuning
+# ------------------
+# Linux GSO offload is automatic (no config toggle).
+# On startup, server logs local TUN GSO status.
+# Per-client, server logs: `server_local`, `client_reported`, and `active` GSO status.
+#
+# Kernel UDP socket buffers (Linux): iroh requests a 7 MiB SO_RCVBUF/SO_SNDBUF,
+# but Linux silently caps the request at net.core.rmem_max / net.core.wmem_max
+# (default ~208 KiB), dropping inbound datagram bursts (seen as inner-TCP
+# retransmits). This is an OS sysctl, not a config key here. Raise it so the
+# full buffer is honored (persist via /etc/sysctl.d/):
+#   sudo sysctl -w net.core.rmem_max=7340032
+#   sudo sysctl -w net.core.wmem_max=7340032
+# ezvpn logs a startup warning when either is below 7 MiB.
+
+# Channel Buffer Sizes
+# --------------------
+# These control packet buffering between tasks. Valid range: 1-65536.
+#
+# Per-client outbound packet buffer (default: 1024)
+# Controls how many packets can be queued for each client before backpressure/drops.
+# Memory impact: client_channel_size * ~1500 bytes * connected_clients
+# - 1024 (default): ~1.5 MB per client worst case
+# client_channel_size = 1024
+#
+# TUN writer aggregate buffer (default: 512)
+# Shared buffer for all client -> TUN traffic. Lower values bound memory usage.
+# Memory impact: tun_writer_channel_size * ~1500 bytes
+# - 512 (default): ~750 KB worst case (safe for memory-constrained hosts)
+# - 2048-4096: Better burst tolerance for high-bandwidth servers
+# tun_writer_channel_size = 512
+
+# Backpressure Behavior
+# ---------------------
+# What to do when a client's send buffer is full (default: false = apply backpressure)
+#
+# false (default): Apply backpressure by blocking the TUN reader until the slow
+#                  client's buffer has space. This guarantees no packet loss.
+#                  Best for development/homelab use where reliability matters.
+#
+# true:            Drop packets for slow clients. Prevents one slow client from
+#                  blocking packet delivery to all other clients (head-of-line
+#                  blocking). Best for real-time traffic like VoIP, gaming, or
+#                  interactive sessions at scale where latency matters more than
+#                  guaranteed delivery.
+#
+# drop_on_full = false
+
+# Security Settings
+# -----------------
+# Disable source IP spoofing checks (default: false)
+#
+# When false (default): Packets are rejected if their source IP matches another
+# client's assigned VPN IP (assigned client IP). This prevents inter-client
+# spoofing while still allowing clients to use their own public IP addresses
+# (useful for dual-stack scenarios where clients have native IPv6).
+#
+# When true: All source IP validation is disabled. Use with caution as this
+# allows clients to send packets with arbitrary source addresses.
+#
+# disable_spoofing_check = false
+
+[iroh]
+# ============================================================================
+# Server Identity (Required)
+# ============================================================================
+
+# Path to secret key file for persistent iroh identity (REQUIRED)
+# Generates same EndpointId across restarts
+# Create with: ezvpn generate-server-key -o ./vpn-server.key
+secret_file = "./vpn-server.key"
+
+# ============================================================================
+# ALPN Token (REQUIRED)
+# ============================================================================
+# A single shared "knock" secret embedded into the iroh ALPN protocol value
+# (ezvpn/3/<alpn_token>). It is negotiated during the QUIC handshake, so a
+# peer that doesn't present the matching token fails to connect BEFORE any
+# stream is opened or the per-client auth token is checked. This keeps
+# unauthorized peers and noise off the server entirely.
+#
+# The SAME alpn_token must be configured on the server and every client.
+# Token format: exactly 14 Base64URL chars (no prefix, no padding).
+# Generate with: ezvpn generate-alpn-token
+#
+# NOTE: Use either alpn_token OR alpn_token_file, not both.
+alpn_token = "<YOUR_ALPN_TOKEN>"  # Replace with real token from generate-alpn-token
+
+# Or use a file containing the token (one token, # comments allowed)
+# alpn_token_file = "./vpn-alpn-token.txt"
+
+# ============================================================================
+# Relay and Discovery (Optional)
+# ============================================================================
+
+# Custom relay server URL(s) for failover
+# Must match client's relay configuration for discovery
+# relay_urls = [
+#     "https://relay1.example.com",
+#     "https://relay2.example.com",
+# ]
+
+# Custom DNS server URL for iroh endpoint discovery (pkarr), or "none" to disable DNS discovery.
+# This is NOT VPN DNS and does not affect client DNS resolution.
+# Must match client's dns_server configuration.
+# NOTE: URL must include the /pkarr path
+# dns_server = "https://dns.example.com/pkarr"
+#
+# Set to "none" to disable DNS-based peer discovery entirely.
+# When disabled, clients and server must use one of these methods to connect:
+#   1. Common relay server - both specify the same relay_urls
+#   2. mDNS - automatic discovery on the same local network
+# dns_server = "none"
+
+# ============================================================================
+# Transport Tuning (Optional)
+# ============================================================================
+# Fine-tune QUIC transport layer for performance optimization.
+# All values have sensible defaults - only configure if needed.
+#
+# NOTE: These settings are dictated to clients during the handshake. Clients
+# always connect with defaults and reconnect once to apply non-default values,
+# so the server is the single source of truth for transport tuning.
+
+[iroh.transport]
+# Congestion controller algorithm (default: cubic)
+# - cubic: Loss-based, widely deployed, best for general internet
+# - bbr: Model-based, may perform better on high-bandwidth/high-latency links
+# - newreno: Classic TCP-like, most conservative
+# congestion_controller = "cubic"
+
+# QUIC receive window in bytes (default: 8388608 = 8MB)
+# Controls flow control - larger values allow more in-flight data
+# Valid range: 1024 (1KB) to 16777216 (16MB)
+# receive_window = 8388608
+
+# QUIC send window in bytes (default: 8388608 = 8MB)
+# Controls how much data can be sent before acknowledgment
+# Valid range: 1024 (1KB) to 16777216 (16MB)
+# send_window = 8388608

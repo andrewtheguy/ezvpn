@@ -1,0 +1,418 @@
+//! Single-instance lock for the VPN client and server.
+//!
+//! Ensures only one VPN instance runs at a time per (role, instance name) to
+//! prevent routing conflicts and TUN device issues. The client and server use
+//! separate lock files, so a client and a server can run simultaneously on the
+//! same host. Clients are additionally scoped by an instance name (default
+//! `default`), so multiple clients with distinct instance names can coexist.
+//!
+//! # Platform Support
+//!
+//! This module supports Linux, macOS, and Windows.
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("VPN lock is only supported on Linux, macOS, and Windows");
+
+use crate::error::{VpnError, VpnResult};
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::{Seek, SeekFrom, Write};
+use std::path::PathBuf;
+
+/// Directory for runtime files (lock files, control sockets, the daemon log).
+///
+/// A **fixed, machine-global, root-owned** directory per platform — `ezvpn`
+/// runs as root (the tunnel creates a TUN device and edits the routing table),
+/// so a per-host location is both reachable by every subcommand and immune to
+/// the environment differences (`sudo` strips `XDG_RUNTIME_DIR`, systemd sets a
+/// different one) that previously made `status`/`stop` look in the wrong place.
+///
+/// Defaults: `/run/ezvpn` on Linux (falling back to `/var/run/ezvpn`),
+/// `/var/run/ezvpn` on macOS, and `%ProgramData%\ezvpn` on Windows (lock
+/// files only; control sockets there are named pipes in a global namespace).
+/// Override with the `EZVPN_RUNTIME_DIR` environment variable (e.g. for
+/// containers, tests, or a rootless deployment).
+#[cfg(not(test))]
+pub(crate) fn runtime_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("EZVPN_RUNTIME_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    platform_runtime_dir()
+}
+
+/// Test build: isolate to a writable per-process temp dir so the suite needs
+/// neither root nor a real `/run`.
+#[cfg(test)]
+pub(crate) fn runtime_dir() -> PathBuf {
+    use std::sync::OnceLock;
+    static TEST_DIR: OnceLock<PathBuf> = OnceLock::new();
+    TEST_DIR
+        .get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("ezvpn-test-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        })
+        .clone()
+}
+
+/// Fixed per-platform runtime directory (used when `EZVPN_RUNTIME_DIR` is
+/// unset). Not compiled into test builds, where [`runtime_dir`] isolates to a
+/// temp dir instead.
+#[cfg(all(not(test), target_os = "linux"))]
+fn platform_runtime_dir() -> PathBuf {
+    // /run is tmpfs on modern systems; /var/run is the legacy location (a
+    // symlink to /run almost everywhere). Prefer whichever base exists.
+    if std::path::Path::new("/run").is_dir() {
+        PathBuf::from("/run/ezvpn")
+    } else {
+        PathBuf::from("/var/run/ezvpn")
+    }
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn platform_runtime_dir() -> PathBuf {
+    PathBuf::from("/var/run/ezvpn")
+}
+
+#[cfg(all(not(test), target_os = "windows"))]
+fn platform_runtime_dir() -> PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    base.join("ezvpn")
+}
+
+/// Ensure the runtime directory exists, creating it owner-only (`0700` on Unix)
+/// on first creation. Returns the directory path. Called from write paths (lock
+/// acquisition, daemon log setup); read-only queries (`status`/`list`) do not
+/// create it.
+pub(crate) fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
+    let dir = runtime_dir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // Create owner-only (0700) atomically so there is no window where the
+        // directory is world/group-accessible. `recursive(true)` makes this a
+        // no-op (permissions left untouched) when an admin pre-created it.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Which single-instance role a lock guards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockRole {
+    /// VPN client instance.
+    Client,
+    /// VPN server instance.
+    Server,
+}
+
+impl LockRole {
+    /// Short slug used to build runtime file names for this role.
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            LockRole::Client => "client",
+            LockRole::Server => "server",
+        }
+    }
+
+    /// Human-readable name used in error messages.
+    fn description(self) -> &'static str {
+        match self {
+            LockRole::Client => "VPN client",
+            LockRole::Server => "VPN server",
+        }
+    }
+}
+
+/// Maximum length of an instance name.
+const MAX_INSTANCE_NAME_LEN: usize = 64;
+
+/// Build the base runtime file name for a role + instance, e.g.
+/// `ezvpn-client-default`. Both the instance lock and the status control
+/// socket derive their paths from this so they stay consistent for a given
+/// (role, instance) within a single user.
+pub(crate) fn runtime_base_name(role: LockRole, instance: &str) -> String {
+    format!("ezvpn-{}-{}", role.slug(), instance)
+}
+
+/// Validate an instance name before it is used as part of a runtime file name.
+///
+/// Names must be non-empty, at most [`MAX_INSTANCE_NAME_LEN`] characters, and
+/// contain only ASCII letters, digits, and underscores. This keeps the name
+/// safe to embed in a path under [`runtime_dir`] (no traversal, no separators,
+/// no surprising filename characters).
+pub fn validate_instance_name(name: &str) -> VpnResult<()> {
+    if name.is_empty() {
+        return Err(VpnError::config("Instance name must not be empty"));
+    }
+    if name.len() > MAX_INSTANCE_NAME_LEN {
+        return Err(VpnError::config(format!(
+            "Instance name must be at most {MAX_INSTANCE_NAME_LEN} characters"
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(VpnError::config(
+            "Instance name may only contain ASCII letters, digits, and underscores",
+        ));
+    }
+    Ok(())
+}
+
+/// Extract the instance name from a lock file name for `role`, if it matches.
+///
+/// Inverse of [`runtime_base_name`] for the `.lock` suffix:
+/// `ezvpn-client-work.lock` -> `Some("work")`. Returns `None` for names that
+/// don't match the role's prefix/suffix or whose instance part is empty.
+fn instance_from_lock_name(file_name: &str, role: LockRole) -> Option<&str> {
+    file_name
+        .strip_prefix(&format!("ezvpn-{}-", role.slug()))?
+        .strip_suffix(".lock")
+        .filter(|instance| !instance.is_empty())
+}
+
+/// List instance names that currently have a lock file for `role` in the
+/// runtime directory.
+///
+/// Lock files are intentionally not removed on exit (see [`VpnLock`]'s `Drop`),
+/// so this includes **stale** entries from instances that have since exited.
+/// Callers that want only *running* instances should probe each one (e.g. via
+/// the control socket). Names that don't pass [`validate_instance_name`] are
+/// skipped, and an unreadable runtime directory yields an empty list. The
+/// result is sorted for stable output.
+pub(crate) fn list_locked_instances(role: LockRole) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(runtime_dir()) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let instance = instance_from_lock_name(file_name.to_str()?, role)?;
+            validate_instance_name(instance).ok()?;
+            Some(instance.to_string())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// A file-based lock to ensure a single VPN client or server instance.
+pub struct VpnLock {
+    /// Path to the lock file.
+    path: PathBuf,
+    /// The lock file handle (kept open to maintain lock).
+    file: File,
+}
+
+impl VpnLock {
+    /// Acquire the single-instance lock for the given role.
+    ///
+    /// Returns an error if another instance of the same role and instance name
+    /// is already running.
+    pub fn acquire(role: LockRole, instance: &str) -> VpnResult<Self> {
+        // Guard against unchecked input (separators/traversal) reaching the lock
+        // path; non-CLI callers may bypass the earlier CLI validation.
+        validate_instance_name(instance)?;
+        let path = Self::lock_path(role, instance);
+
+        // Ensure the runtime directory (the lock file's parent) exists.
+        ensure_runtime_dir().map_err(|e| {
+            VpnError::config_with_source("Failed to create runtime directory", e)
+        })?;
+
+        // Open or create the lock file (do not truncate before acquiring lock)
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| VpnError::config_with_source("Failed to open lock file", e))?;
+
+        // Try to acquire exclusive lock (non-blocking) via std's native file
+        // locking (stabilized in Rust 1.89).
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(VpnError::config(format!(
+                    "Another {} is already running. Only one instance allowed.",
+                    role.description()
+                )));
+            }
+            Err(TryLockError::Error(e)) => {
+                return Err(VpnError::config_with_source(
+                    "Failed to acquire VPN lock",
+                    e,
+                ));
+            }
+        }
+
+        // Now that we hold the lock, truncate and write our PID
+        file.set_len(0)
+            .map_err(|e| VpnError::config_with_source("Failed to truncate lock file", e))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| VpnError::config_with_source("Failed to seek lock file", e))?;
+        writeln!(file, "{}", std::process::id())
+            .map_err(|e| VpnError::config_with_source("Failed to write PID to lock file", e))?;
+
+        log::debug!("Acquired VPN lock: {}", path.display());
+
+        Ok(Self { path, file })
+    }
+
+    /// Get the path to the lock file for the given role and instance.
+    fn lock_path(role: LockRole, instance: &str) -> PathBuf {
+        runtime_dir().join(format!("{}.lock", runtime_base_name(role, instance)))
+    }
+}
+
+/// Read the PID recorded in an instance's lock file.
+///
+/// Returns `Ok(None)` if no lock file exists (instance never started) or its
+/// contents aren't a valid PID. Used by `client stop` to signal the process.
+pub(crate) fn read_instance_pid(role: LockRole, instance: &str) -> std::io::Result<Option<u32>> {
+    // Re-validate (like `acquire`) so a separator/traversal name cannot reach
+    // `lock_path` through this pub(crate) helper, even if a caller skips the
+    // earlier CLI validation.
+    validate_instance_name(instance)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    match std::fs::read_to_string(VpnLock::lock_path(role, instance)) {
+        Ok(contents) => Ok(contents.trim().parse::<u32>().ok()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+impl Drop for VpnLock {
+    fn drop(&mut self) {
+        if let Err(e) = self.file.unlock() {
+            log::warn!(
+                "Failed to unlock VPN lock file {}: {}",
+                self.path.display(),
+                e
+            );
+        }
+
+        // The lock is automatically released when the file is closed,
+        // which happens when self.file is dropped. We don't remove the lock file
+        // to avoid a race condition where another process could acquire a lock
+        // on the about-to-be-unlinked inode while a third process creates a new
+        // file with the same name.
+        log::debug!("Released VPN lock: {}", self.path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A single test covers both roles. Rust runs tests in parallel by default,
+    // so keeping all acquisition of these process-wide file locks in one test
+    // function avoids cross-test races.
+    #[test]
+    fn test_lock_acquire_release() {
+        // Client and server use separate lock files, so both can be held at
+        // the same time.
+        assert_ne!(
+            VpnLock::lock_path(LockRole::Client, "default"),
+            VpnLock::lock_path(LockRole::Server, "default")
+        );
+        let client =
+            VpnLock::acquire(LockRole::Client, "default").expect("Should acquire client lock");
+        let server =
+            VpnLock::acquire(LockRole::Server, "default").expect("Should acquire server lock");
+
+        // A second lock attempt for the same role+instance fails while one is held.
+        assert!(VpnLock::acquire(LockRole::Client, "default").is_err());
+        assert!(VpnLock::acquire(LockRole::Server, "default").is_err());
+
+        // Drop releases the locks.
+        drop(client);
+        drop(server);
+
+        // Should be able to acquire again after release.
+        let _client2 =
+            VpnLock::acquire(LockRole::Client, "default").expect("Should acquire client again");
+        let _server2 =
+            VpnLock::acquire(LockRole::Server, "default").expect("Should acquire server again");
+    }
+
+    // Two different client instances use different lock files, so both can be
+    // held at the same time. Kept in its own test function (distinct instance
+    // names) so it does not race the process-wide locks above.
+    #[test]
+    fn test_distinct_instances_coexist() {
+        assert_ne!(
+            VpnLock::lock_path(LockRole::Client, "alpha"),
+            VpnLock::lock_path(LockRole::Client, "beta")
+        );
+        let a = VpnLock::acquire(LockRole::Client, "alpha").expect("acquire alpha");
+        let b = VpnLock::acquire(LockRole::Client, "beta").expect("acquire beta");
+
+        // Re-acquiring the same instance fails while it is held.
+        assert!(VpnLock::acquire(LockRole::Client, "alpha").is_err());
+
+        drop(a);
+        drop(b);
+    }
+
+    #[test]
+    fn test_instance_from_lock_name() {
+        assert_eq!(
+            instance_from_lock_name("ezvpn-client-work.lock", LockRole::Client),
+            Some("work")
+        );
+        assert_eq!(
+            instance_from_lock_name("ezvpn-server-default.lock", LockRole::Server),
+            Some("default")
+        );
+        // Wrong role prefix.
+        assert_eq!(
+            instance_from_lock_name("ezvpn-server-default.lock", LockRole::Client),
+            None
+        );
+        // Not a lock file (e.g. the control socket) or empty instance.
+        assert_eq!(
+            instance_from_lock_name("ezvpn-client-work.sock", LockRole::Client),
+            None
+        );
+        assert_eq!(
+            instance_from_lock_name("ezvpn-client-.lock", LockRole::Client),
+            None
+        );
+        assert_eq!(
+            instance_from_lock_name("unrelated.lock", LockRole::Client),
+            None
+        );
+    }
+
+    #[test]
+    fn test_validate_instance_name() {
+        for ok in ["default", "work", "a_b_1", "A1", "x"] {
+            assert!(validate_instance_name(ok).is_ok(), "{ok} should be valid");
+        }
+        for bad in ["", "../x", "a/b", "a-b", "a.b", "has space", "tab\t"] {
+            assert!(
+                validate_instance_name(bad).is_err(),
+                "{bad:?} should be invalid"
+            );
+        }
+        // Over-length name is rejected.
+        let too_long = "a".repeat(MAX_INSTANCE_NAME_LEN + 1);
+        assert!(validate_instance_name(&too_long).is_err());
+        // Exactly at the limit is accepted.
+        let at_limit = "a".repeat(MAX_INSTANCE_NAME_LEN);
+        assert!(validate_instance_name(&at_limit).is_ok());
+    }
+}

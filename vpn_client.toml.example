@@ -1,0 +1,141 @@
+# ezvpn client configuration example
+#
+# Usage: ezvpn client run -c vpn_client.toml
+#        ezvpn client run --default-config
+#
+# CLI arguments take precedence over config file values.
+#
+# Config is grouped by purpose:
+#   [network] - VPN routes to install once connected
+#   [auth]    - the auth token presented to the server
+#   top-level - client runtime behavior (reconnection)
+#   [iroh]    - iroh transport: server identity, ALPN, relays, discovery
+
+# Required: validates config matches CLI command
+role = "vpnclient"
+
+# ============================================================================
+# Reconnection Behavior (Optional, top-level)
+# ============================================================================
+# Client-process behavior, not iroh transport settings.
+
+# Enable auto-reconnect on connection loss (default: true)
+# When true, client will automatically reconnect if the server restarts
+# or the connection is lost. When false, client exits on first disconnection.
+# auto_reconnect = true
+
+# Maximum reconnect attempts (omit or comment out for unlimited)
+# Only applies when auto_reconnect = true
+# Must be a positive integer (1 or greater)
+# max_reconnect_attempts = 5
+
+[auth]
+# ============================================================================
+# Authentication (REQUIRED)
+# ============================================================================
+# Token provided by the server admin for authentication
+# Token format: exactly 47 characters (`v` + 46 Base64URL chars, no padding)
+# Generate with: ezvpn generate-auth-token
+
+# NOTE: Use either auth_token OR auth_token_file, not both.
+auth_token = "<YOUR_AUTH_TOKEN>"  # Replace with real token from generate-auth-token
+
+# Or use a file containing the token (one token, no comments)
+# NOTE: Use either auth_token OR auth_token_file, not both.
+# auth_token_file = "~/.config/ezvpn/vpn-token.txt"
+
+[network]
+# ============================================================================
+# Routing (Optional)
+# ============================================================================
+
+# CIDRs to route through the VPN (like WireGuard AllowedIPs)
+# If omitted, no routes are added and you must configure routing manually.
+# Examples:
+#   - Full tunnel (all traffic): ["0.0.0.0/0"]
+#   - Split tunnel (specific networks): ["192.168.1.0/24", "10.0.0.0/8"]
+# routes = [
+#     "0.0.0.0/0",  # Full tunnel - route all traffic through VPN
+# ]
+
+# ----------------------------------------------------------------------------
+# IPv6 Routing (Optional)
+# ----------------------------------------------------------------------------
+# IPv6 routes are only used if the server provides IPv6 configuration.
+# If the server has network6 configured, you can route IPv6 traffic through
+# the VPN tunnel.
+
+# IPv6 CIDRs to route through the VPN
+# Examples:
+#   - Full tunnel (all IPv6): ["::/0"]
+#   - Split tunnel (specific networks): ["2001:db8::/32", "fd00::/8"]
+# NAT64 client (IPv6-only) example:
+#   - Set your system DNS to a DNS64 resolver (Google Public DNS64):
+#       2001:4860:4860::6464
+#       2001:4860:4860::64
+#   - Route the NAT64 prefix through the VPN:
+# routes6 = [
+#     "64:ff9b::/96",  # NAT64
+# ]
+# routes6 = [
+#     "::/0",  # Full tunnel - route all IPv6 traffic through VPN
+# ]
+
+[iroh]
+# ============================================================================
+# Server Connection (REQUIRED)
+# ============================================================================
+
+# Server's EndpointId to connect to (REQUIRED)
+# Get this from the server operator (shown when server starts, or via show-server-id)
+server_node_id = "changeme"
+
+# ============================================================================
+# ALPN Token (REQUIRED)
+# ============================================================================
+# A shared "knock" secret embedded into the iroh ALPN protocol value. It must
+# match the server's alpn_token exactly, or the connection fails at the QUIC
+# handshake before authentication. The server admin generates and supplies this
+# token; copy it here exactly as provided (do not generate your own).
+# Token format: exactly 14 Base64URL chars (no prefix, no padding).
+#
+# NOTE: Use either alpn_token OR alpn_token_file, not both.
+# CLI equivalents: --alpn-token / --alpn-token-file (take precedence).
+alpn_token = "<YOUR_ALPN_TOKEN>"  # Paste the exact token supplied by the server admin
+
+# Or use a file containing the token (one token, # comments allowed)
+# alpn_token_file = "~/.config/ezvpn/vpn-alpn-token.txt"
+
+# ============================================================================
+# Performance Tuning
+# ============================================================================
+
+# Linux GSO offload is automatic (no config toggle).
+# Client connection logs report local, server, and negotiated GSO status.
+
+# MTU and QUIC transport tuning (congestion controller, receive/send windows)
+# are dictated by the server during the handshake and cannot be configured
+# on the client.
+
+# ============================================================================
+# Relay and Discovery (Optional)
+# ============================================================================
+
+# Custom relay server URL(s) for failover
+# Must match server's relay configuration for discovery
+# relay_urls = [
+#     "https://relay1.example.com",
+#     "https://relay2.example.com",
+# ]
+
+# Custom DNS server URL for iroh endpoint discovery (pkarr), or "none" to disable DNS discovery.
+# This is NOT VPN DNS and does not affect client DNS resolution.
+# Must match server's dns_server configuration.
+# NOTE: URL must include the /pkarr path
+# dns_server = "https://dns.example.com/pkarr"
+#
+# Set to "none" to disable DNS-based peer discovery entirely.
+# When disabled, clients and server must use one of these methods to connect:
+#   1. Common relay server - both specify the same relay_urls
+#   2. mDNS - automatic discovery on the same local network
+# dns_server = "none"

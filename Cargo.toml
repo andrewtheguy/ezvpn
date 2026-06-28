@@ -1,0 +1,51 @@
+[package]
+name = "ezvpn"
+version = "0.0.1"
+edition = "2024"
+description = "IP-over-QUIC VPN tunnel via iroh P2P"
+readme = "README.md"
+repository = "https://github.com/andrewtheguy/ezvpn"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+dirs = "6"
+env_logger = "0.11"
+etherparse = "0.18"
+futures = "0.3"
+ipnet = { version = "2", features = ["serde"] }
+iroh = "1.0.0"
+iroh-mdns-address-lookup = "0.4.0"
+noq-proto = "1.0.0"
+log = "0.4"
+libc = "0.2"
+rand = "0.9"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tun = { version = "0.8", features = ["async"] }
+url = "2"
+
+# Unix-only: backgrounding via fork/setsid. Not built on Windows (the crate is
+# Unix-only, and `--daemon` is gated to Unix in the code). `daemonix` is a
+# maintained drop-in fork of the unmaintained `daemonize` crate.
+[target.'cfg(unix)'.dependencies]
+daemonix = "0.1"
+
+[dev-dependencies]
+mock_instant = "0.5"
+rand_chacha = "0.9"
+tempfile = "3.24.0"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+panic = "abort"
