@@ -293,6 +293,10 @@ graph TB
     style F fill:#FFF9C4
 ```
 
+#### ALPN and Protocol Versioning
+
+The current advertised ALPN is `ezvpn/4/<token>`; wire protocol v3 is separate from that ALPN version, and older peers are rejected during QUIC negotiation.
+
 ### Client Isolation
 
 Inter-client traffic is dropped unconditionally on the server, in userspace, with no config flag and no firewall / `ip_forward` dependency.

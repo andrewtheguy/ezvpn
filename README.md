@@ -10,9 +10,7 @@ open inbound ports. Relay fallback is used when a direct path is unavailable.
 > [!WARNING]
 > While `ezvpn` remains in the `0.0.x` series, there is no backward
 > compatibility between versions. Regenerate server keys and refresh configs on
-> every upgrade. The current advertised ALPN is `ezvpn/4/<token>`; wire protocol
-> v3 is separate from that ALPN version, and older peers are rejected during
-> QUIC negotiation.
+> every upgrade.
 
 > [!NOTE]
 > Running `ezvpn` requires root/Administrator privileges to create TUN devices
