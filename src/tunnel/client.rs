@@ -1353,10 +1353,16 @@ impl BypassRouteManager {
     /// tunnel, so keeping a no-longer-listed one for the rest of the session is
     /// harmless; never tearing it down mid-session is what keeps the path stable.
     ///
-    /// The user-visible caveat (the pinned public address is reachable only over
-    /// the underlay, so in-tunnel resources must be addressed by their VPN IP)
-    /// is documented in `docs/ARCHITECTURE.md` ("Underlay Bypass Routes") and the
-    /// README "Routing" section.
+    /// Scope: `required_ips` only ever contains the addresses iroh uses for
+    /// transport (the server's direct underlay address, plus any relay it falls
+    /// back to — see `collect_addresses_from_paths`), filtered to those covered
+    /// by a VPN route. So a bypass pins *only that one transport endpoint*, never
+    /// other hosts in the routed prefix; the rest of the CIDR still tunnels.
+    ///
+    /// User-visible caveat: the pinned address is reachable only over the
+    /// underlay, not through the VPN, so a resource on that same host must be
+    /// addressed by its VPN-internal IP. Documented in `docs/ARCHITECTURE.md`
+    /// ("Underlay Bypass Routes") and the README "Routing" section.
     async fn update(&mut self, required_ips: HashSet<IpAddr>) {
         // Only bypass iroh peer IPs that a VPN route would otherwise capture.
         // An IP outside every VPN route prefix is already routed correctly by

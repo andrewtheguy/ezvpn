@@ -288,13 +288,22 @@ tunnel — the exact failure the bypass exists to prevent. A bypass route only
 pins one peer's underlay address (the server's transport address) off the
 tunnel, so keeping a no-longer-listed one for the session is harmless.
 
-**Caveat (user-visible).** As a consequence, the public address used for tunnel
+Only the addresses iroh actually uses for transport are ever bypassed: the
+manager's required set comes from `collect_addresses_from_paths`, i.e. the
+connection's direct remote addresses (the server's underlay address) and any
+relay it falls back to — never arbitrary destinations. So a bypass pins **only
+that one transport endpoint, not the rest of the routed prefix**: other hosts
+inside the same CIDR still route through the VPN normally. In a full tunnel
+(`0.0.0.0/0`/`::/0`) the server and relay addresses are always covered and thus
+always pinned; in a split tunnel only an endpoint that overlaps a routed CIDR is.
+
+**Caveat (user-visible).** As a consequence, the one address used for tunnel
 transport is reachable only over the underlay, not through the VPN, while the
-client is connected. If the same host also exposes resources meant to be reached
+client is connected. If that same host also exposes resources meant to be reached
 *through* the tunnel, those must be addressed by their **VPN-internal IP** (the
-in-subnet server/peer address, e.g. `10.x` / `fd11:…`, or another address within
-the routed CIDR) — not by the public address that doubles as the tunnel underlay
-endpoint. This is documented for end users in the README "Routing" section.
+in-subnet server/peer address, e.g. `10.x` / `fd11:…`) — not by the public
+address that doubles as the tunnel underlay endpoint. This is documented for end
+users in the README "Routing" section.
 
 ### Security Model
 
