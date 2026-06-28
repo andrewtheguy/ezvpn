@@ -146,6 +146,43 @@ fn program_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
 }
 
+/// System-wide configuration directory — the default location for the
+/// server/client TOML config files when neither `-c` nor `--default-config`'s
+/// explicit path is given.
+///
+/// Machine-global on every platform (not a per-user home directory): `ezvpn`
+/// runs as root/LocalSystem, so its config belongs in the system location where
+/// every subcommand resolves the same place regardless of which user invokes it.
+///
+/// Defaults: `/etc/ezvpn` on Linux, `/usr/local/etc/ezvpn` on macOS, and
+/// `%ProgramData%\ezvpn` on Windows.
+#[cfg(not(test))]
+pub(crate) fn config_dir() -> PathBuf {
+    platform_config_dir()
+}
+
+/// Test build: isolate to the same writable per-process temp dir as the other
+/// path helpers so the suite neither reads a real `/etc` nor needs root.
+#[cfg(test)]
+pub(crate) fn config_dir() -> PathBuf {
+    runtime_dir()
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn platform_config_dir() -> PathBuf {
+    PathBuf::from("/etc/ezvpn")
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn platform_config_dir() -> PathBuf {
+    PathBuf::from("/usr/local/etc/ezvpn")
+}
+
+#[cfg(all(not(test), target_os = "windows"))]
+fn platform_config_dir() -> PathBuf {
+    program_data_dir().join("ezvpn")
+}
+
 /// Names of the directory-override environment variables, checked by
 /// [`validate_dir_env`].
 const DIR_ENV_VARS: [&str; 2] = ["EZVPN_RUNTIME_DIR", "EZVPN_LOG_DIR"];

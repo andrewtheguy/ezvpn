@@ -230,7 +230,7 @@ precedence over client config file values.
 | Option | Description |
 |--------|-------------|
 | `-c, --config <FILE>` | Server config path |
-| `--default-config` | Use `~/.config/ezvpn/vpn_server.toml` |
+| `--default-config` | Use `vpn_server.toml` in the system config dir (`/etc/ezvpn` on Linux, `/usr/local/etc/ezvpn` on macOS, `%ProgramData%\ezvpn` on Windows) |
 
 `ezvpn server status` prints the running server's uptime, mode, connected
 clients with assigned IPs and iroh paths, and packet counters. Add `--json` for
@@ -246,7 +246,7 @@ machine-readable output.
 | Option | Description |
 |--------|-------------|
 | `-c, --config <FILE>` | Client config path |
-| `--default-config` | Use `~/.config/ezvpn/vpn_client.toml` |
+| `--default-config` | Use `vpn_client.toml` in the system config dir (`/etc/ezvpn` on Linux, `/usr/local/etc/ezvpn` on macOS, `%ProgramData%\ezvpn` on Windows) |
 | `-n, --server-node-id <ID>` | VPN server `EndpointId` |
 | `--auth-token <TOKEN>` | Authentication token |
 | `--auth-token-file <PATH>` | Read auth token from file |
