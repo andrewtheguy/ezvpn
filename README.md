@@ -301,6 +301,13 @@ The runtime directory holds ephemeral state (lock files and control sockets)
 and is machine-global: `/run/ezvpn` on Linux, `/var/run/ezvpn` on macOS, and
 `%ProgramData%\ezvpn` on Windows. Override it with `EZVPN_RUNTIME_DIR`.
 
+`--default-config` reads its TOML from the machine-global system config
+directory — `/etc/ezvpn` on Linux, `/usr/local/etc/ezvpn` on macOS, and
+`%ProgramData%\ezvpn` on Windows — not a per-user home directory, since `ezvpn`
+runs as root/LocalSystem. On Windows the `%ProgramData%` location is resolved
+via the Known Folders API, so it follows the actual install drive rather than
+assuming `C:\`.
+
 On Unix, the daemon log is kept separately in the persistent log directory:
 `/var/log/ezvpn` on Linux and macOS. Override it with `EZVPN_LOG_DIR`. The log
 is size-capped: at 10 MiB it rotates to a single `<name>.log.1` backup
