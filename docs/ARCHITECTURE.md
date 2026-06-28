@@ -53,7 +53,7 @@ IPv4 is optional: the server can run IPv6-only with `network6` and no `network`.
 
 ```mermaid
 graph LR
-    subgraph "vpn-core Crate"
+    subgraph "ezvpn crate"
         A[VpnServer / VpnClient]
         C[TUN Device<br/>tun crate]
         D[IP Pool<br/>address management]
@@ -79,7 +79,11 @@ sequenceDiagram
     participant SI as Server iroh
     participant S as Server
 
-    Note over C: User runs vpn client
+    Note over S: Server startup
+    S->>S: Create TUN device (tun0)
+    S->>S: Assign gateway IP(s) (10.0.0.1, fd00::1)
+
+    Note over C: User runs ezvpn client
     C->>C: Acquire VPN lock
     C->>C: Generate session device_id
     C->>CI: Create iroh endpoint
@@ -90,9 +94,9 @@ sequenceDiagram
     Note over C,S: VPN Handshake Phase
     C->>S: VpnHandshake {device_id, auth_token}
     S->>S: Validate auth token
-    S->>S: Store client (EndpointId, device_id)
     S->>S: Allocate IP(s) from pool(s)
     S-->>C: VpnHandshakeResponse {assigned_ip, network, server_ip, transport, mtu, ...}
+    S->>S: Store client (EndpointId, device_id)
 
     Note over C,S: Transport Upgrade (only if server dictates non-default tuning)
     C->>C: Compare dictated transport vs baseline
@@ -104,8 +108,6 @@ sequenceDiagram
     C->>C: Create TUN device (tun0, server-dictated MTU)
     C->>C: Assign IP(s) (10.0.0.2, fd00::2)
     C->>C: Configure routes
-    S->>S: Create TUN device (tun0)
-    S->>S: Assign IP(s) (10.0.0.1, fd00::1)
 
     Note over C,S: Direct IP Tunnel Active
     loop Packet Flow
@@ -126,9 +128,9 @@ The response includes different address fields depending on the server's address
 |------|-------------------|
 | IPv4-only | `assigned_ip`, `network`, `server_ip` |
 | IPv6-only | `assigned_ip6`, `network6`, `server_ip6` |
-| Dual-stack | All six fields: `assigned_ip`, `network`, `server_ip`, `assigned_ip6`, `network6`, `server_ip6` |
+| Dual-stack | All six fields when both pools allocate: `assigned_ip`, `network`, `server_ip`, `assigned_ip6`, `network6`, `server_ip6` |
 
-When `network6` is configured on the server, clients receive IPv6 addresses alongside IPv4 (dual-stack) or IPv6-only if `network` is omitted.
+When `network6` is configured on the server, clients normally receive IPv6 addresses alongside IPv4 (dual-stack) or IPv6-only if `network` is omitted. In dual-stack mode, if one address pool is exhausted, the server can still accept the client with the other address family.
 
 Every accepted response additionally carries the server-dictated settings (see "Server-Dictated Configuration" below): `transport` (`WireTransport`: congestion controller and concrete receive/send windows) and `mtu`.
 
@@ -136,10 +138,10 @@ Every accepted response additionally carries the server-dictated settings (see "
 
 The server is the single source of truth for QUIC transport tuning (`[iroh.transport]`: congestion controller, receive/send windows) and the VPN `mtu`. Clients do not configure these; the server sends the fully resolved values in the handshake response and the client applies them:
 
-- **MTU**: the client creates its TUN device after the handshake, using the dictated `mtu` directly. The effective value is bounded by the QUIC datagram size: `QUIC_INITIAL_MTU` is 1452 (the IPv6-safe maximum for a standard 1500-byte Ethernet path), giving a `max_datagram_size` of ~1416 and a datagram-safe inner MTU of ~1400. This **assumes a ≥1500-MTU path** (LAN / most broadband). The inner TUN MTU is snapshotted from `max_datagram_size` at connection time and **cannot follow QUIC path-MTU discovery afterward** (a TUN device MTU is fixed for the connection's life). On a constrained or tunnel-in-tunnel path, QUIC black-hole detection lowers the *live* path MTU but the snapshotted TUN MTU stays high, so full-size packets are dropped (`SendDatagramError::TooLarge`); the workaround is to lower the server `mtu` config so the snapshot starts small enough for that path. Keep the effective MTU ≥ 1280 for IPv6.
+- **MTU**: the server clamps its shared TUN MTU to `min(config.mtu, 1400)` (`DATAGRAM_SAFE_MTU`) and clamps each client's advertised `mtu` again to that connection's `max_datagram_size - DATAGRAM_FRAMING_OVERHEAD`. `QUIC_INITIAL_MTU` is 1452 (the IPv6-safe maximum for a standard 1500-byte Ethernet path), giving a handshake-time `max_datagram_size` of about 1416 and a datagram-safe inner MTU of about 1400. This assumes a >=1500-MTU path (LAN / most broadband). The client creates its TUN device after the handshake using the already-clamped `mtu`, and that TUN MTU cannot follow later QUIC path-MTU discovery because the TUN device MTU is fixed for the connection's life. On a constrained or tunnel-in-tunnel path, QUIC black-hole detection lowers the live path MTU but the TUN MTU stays high, so full-size packets may be dropped (`SendDatagramError::TooLarge`); the workaround is to lower the server `mtu` config so the advertised value starts small enough for that path. Keep the effective MTU >= 1280 for IPv6.
 - **Transport tuning**: the congestion controller (and send window) cannot be changed on a live QUIC connection, so the client always connects with the default baseline (cubic, 8 MB windows). If the dictated `transport` differs from that baseline, the client closes the connection and reconnects once with a per-connection transport config (`Endpoint::connect_with_opts`), then re-handshakes. The same `device_id` is reused, so the server's idempotent IP allocation returns the same addresses. When the server runs default tuning, no extra reconnect occurs.
 
-The shared builder (`build_quic_transport_config` in `src/vpn_core/transport.rs`) is used for both endpoint creation and the per-connection upgrade, so both paths apply identical keep-alive, idle-timeout, congestion-controller and window settings. The wire values are resolved via `TransportTuning::effective_windows()` on the server, guaranteeing they match what the server's own endpoint uses.
+The shared builder (`build_quic_transport_config` in `src/transport/mod.rs`) is used for both endpoint creation and the per-connection upgrade, so both paths apply identical keep-alive, idle-timeout, congestion-controller and window settings. The wire values are resolved via `TransportTuning::effective_windows()` on the server, guaranteeing they match what the server's own endpoint uses.
 
 ### Direct IP over QUIC Integration
 
@@ -160,7 +162,7 @@ The `device_id` is generated at startup with `rand::rng().random::<u64>()`. It i
 
 The `device_id` is used **purely for session tracking** within an already-authenticated iroh connection—it is NOT used for access control. Security relies on:
 1. iroh's cryptographic `EndpointId` authentication
-2. Auth token validation (if configured)
+2. Auth token validation
 
 Clients are keyed by `(EndpointId, device_id)`, so an attacker cannot hijack a session by guessing a `device_id` without also possessing the victim's iroh private key.
 
@@ -172,10 +174,10 @@ The 64-bit ID space provides a ~2^32 birthday bound for collisions, which is suf
 
 Per-packet cost dominates tunnel throughput: every ~MTU-sized TCP segment otherwise pays its own framing, channel send and QUIC write. `ezvpn` moves whole TCP "super-packets" (up to 64 KB) through the tunnel whenever possible and segments them as late as possible — ideally in the receiving kernel.
 
-**Offload metadata:** IP frames may carry a 10-byte `virtio_net_hdr` (the Linux TUN `IFF_VNET_HDR` format, parsed/serialized in `src/vpn_core/offload.rs`) describing TCP GSO state: segment size (MSS), header length and partial-checksum position. The v2 IP frame embeds it via the `offload_len` byte.
+**Offload metadata:** IP frames may carry a 10-byte `virtio_net_hdr` (the Linux TUN `IFF_VNET_HDR` format, parsed/serialized in `src/tunnel/offload.rs`) describing TCP GSO state: segment size (MSS), header length and partial-checksum position. The v2 IP frame embeds it via the `offload_len` byte.
 
 **Capability negotiation:**
-- The client always advertises GSO support in its `Capabilities` message (it can software-segment anything it receives).
+- The client always advertises GSO support in its `VpnHandshake` (it can software-segment anything it receives).
 - The server reports its TUN offload capability as `server_gso_enabled` in the handshake response, and sets `connection_gso_active = server TUN offload enabled && client advertised GSO` per client.
 
 **Data paths** (each side picks per packet, based on what its local TUN supports):
@@ -183,7 +185,7 @@ Per-packet cost dominates tunnel throughput: every ~MTU-sized TCP segment otherw
 | Path | Local TUN has offload | Behavior |
 |------|----------------------|----------|
 | Egress, kernel GRO | yes (Linux) | Kernel hands coalesced super-frames + `virtio_net_hdr` to the TUN reader; forwarded with metadata when the peer accepts GSO, otherwise software-segmented (`materialize_offload_packet`) before framing |
-| Egress, software GRO | no (macOS/Windows, or Linux without vnet headers) | `TcpGroTable` (in `offload.rs`) coalesces consecutive in-order same-flow TCP segments into a super-frame with a synthetic `virtio_net_hdr`, flushed within `GRO_FLUSH_WINDOW` (500µs) |
+| Egress, software GRO | no (macOS/Windows, or Linux without vnet headers) | `TcpGroTable` (in `offload.rs`) coalesces consecutive in-order same-flow TCP segments into a super-frame with a synthetic `virtio_net_hdr`, then flushes when the TUN read side drains |
 | Ingress, kernel TSO | yes (Linux) | Offload-tagged frames are written to the TUN with their metadata; the kernel segments and completes checksums |
 | Ingress, software segmentation | no | `materialize_offload_packet` splits the super-frame into plain per-MSS packets with recomputed checksums before the TUN write |
 
@@ -194,7 +196,7 @@ Per-packet cost dominates tunnel throughput: every ~MTU-sized TCP segment otherw
 - The coalesced TCP checksum field holds the folded (not complemented) pseudo-header sum per the Linux `CHECKSUM_PARTIAL` convention, so the receiving kernel/NIC completes it per segment under TSO.
 - On the server's TUN→client direction, GRO state is additionally keyed per destination client and evicted when the client disconnects.
 
-The outbound loops on both sides are a `tokio::select!` between the TUN read and the GRO flush deadline; on a GSO-capable Linux TUN the software-GRO path is bypassed entirely (the kernel already coalesces).
+The outbound loops drain packets already queued on the TUN and flush pending software-GRO groups as soon as the read side drains; on a GSO-capable Linux TUN the software-GRO path is bypassed entirely (the kernel already coalesces).
 
 ### Throughput Design
 
@@ -255,7 +257,7 @@ graph TB
     style D6 fill:#BBDEFB
 ```
 
-When both `network` and `network6` are configured, each client receives both an IPv4 and IPv6 address. If `network` is omitted, the IPv4 pool is not created and the server runs IPv6-only. The default IPv6 strategy allocates sequential /128 client addresses with release/reuse behavior similar to IPv4; `ip6_strategy = "node-id"` instead derives stable client IPv6 addresses from iroh node IDs and rejects duplicate derived addresses. With a /64, sequential IPv6 pool exhaustion is not a practical concern for normal deployments.
+When both `network` and `network6` are configured, each client normally receives both an IPv4 and IPv6 address. If one family is exhausted in dual-stack mode, the server can still allocate the other family; if all configured pools are exhausted, the connection is rejected. If `network` is omitted, the IPv4 pool is not created and the server runs IPv6-only. The default IPv6 strategy allocates sequential /128 client addresses with release/reuse behavior similar to IPv4; `ip6_strategy = "node-id"` instead derives stable client IPv6 addresses from iroh node IDs and rejects duplicate derived addresses. With a /64, sequential IPv6 pool exhaustion is not a practical concern for normal deployments.
 
 ### Platform-Specific Details
 
@@ -263,7 +265,7 @@ When both `network` and `network6` are configured, each client receives both an 
 |----------|------------|---------------------|------------|
 | Linux | `/dev/net/tun` | `ip route add` | CAP_NET_ADMIN or root |
 | macOS | `utunX` | `route add` | root |
-| Windows | `wintun.dll` | `route add` | Administrator |
+| Windows | `wintun.dll` | `netsh interface route` | Administrator |
 
 ### Security Model
 
@@ -339,13 +341,13 @@ liveness is detected entirely by QUIC:
   close, or path failure) the tunnel tears down and (if enabled) reconnects.
 - TUN read/write errors and datagram read/send errors also end the tunnel.
 
-These keep-alive / idle-timeout values live in `src/vpn_core/transport.rs`
+These keep-alive / idle-timeout values live in `src/transport/mod.rs`
 (`QUIC_KEEP_ALIVE_INTERVAL`, `QUIC_IDLE_TIMEOUT`).
 
 **Datagram framing:**
 
 Each datagram carries one message, prefixed with a 1-byte `DataMessageType`
-(`src/vpn_core/signaling.rs`). The datagram boundary is the message length, so
+(`src/tunnel/signaling.rs`). The datagram boundary is the message length, so
 there is no length prefix:
 
 ```

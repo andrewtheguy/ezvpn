@@ -193,7 +193,7 @@ secret_file = "./vpn-server.key"
 # ALPN Token (REQUIRED)
 # ============================================================================
 # A single shared "knock" secret embedded into the iroh ALPN protocol value
-# (ezvpn/3/<alpn_token>). It is negotiated during the QUIC handshake, so a
+# (ezvpn/4/<alpn_token>). It is negotiated during the QUIC handshake, so a
 # peer that doesn't present the matching token fails to connect BEFORE any
 # stream is opened or the per-client auth token is checked. This keeps
 # unauthorized peers and noise off the server entirely.

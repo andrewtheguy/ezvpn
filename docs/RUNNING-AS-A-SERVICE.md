@@ -19,13 +19,14 @@ A service manager is still preferred for unattended deployments because it
 handles restart-on-crash and start-at-boot; use the **foreground** form under a
 service manager (let it own backgrounding), not `--daemon`.
 
-These examples cover the **client**. The server is the same pattern with
-`server start` and a fixed instance, so it's omitted here.
+These examples cover the **client**. The server uses the same service-manager
+pattern with `ezvpn server start -c ...`; it has no `--instance` flag and uses
+the fixed `default` instance for `server status` / `server list`.
 
 > The tunnel creates a TUN device and edits the routing table, so the service
 > must run with administrative privileges (root / LocalSystem).
 
-## A note on the runtime directory (`status` / `list` / `stop`)
+## A note on the runtime directory (`status` / `list` / Unix `stop`)
 
 `ezvpn` keeps its per-instance lock file, control socket, and (with
 `--daemon`) log file in a **fixed, machine-global runtime directory**:
@@ -33,12 +34,13 @@ These examples cover the **client**. The server is the same pattern with
 `/var/run/ezvpn` on macOS, and `%ProgramData%\ezvpn` on Windows. It is
 created (owner-only) on first run.
 
-Because the location is fixed and the daemon runs as root, `status` / `list` /
-`stop` resolve the same place no matter how the service was started — no
-`XDG_RUNTIME_DIR` pinning is needed. Run the query commands as root (`sudo`), the
-same privilege the tunnel itself requires. Set `EZVPN_RUNTIME_DIR` only if you
-need a non-default location (e.g. containers or a rootless deployment); if you
-do, set it identically for the service and for the commands you type by hand.
+Because the location is fixed and the daemon runs as root, `status` / `list`
+and Unix `stop` resolve the same place no matter how the service was started —
+no `XDG_RUNTIME_DIR` pinning is needed. Run `status` / `list` elevated
+(`sudo` or Administrator), and run Unix `stop` with `sudo`. Set
+`EZVPN_RUNTIME_DIR` only if you need a non-default location (e.g. containers or
+a rootless deployment); if you do, set it identically for the service and for
+the commands you type by hand.
 
 ---
 

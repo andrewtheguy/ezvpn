@@ -263,11 +263,11 @@ machine-readable output.
 | `--daemon` | Fork into the background on Unix; logs to `<runtime_dir>/ezvpn-client-<instance>.log` |
 
 With `--daemon`, the client validates its config and paths before forking, so
-startup errors are still reported in the foreground. Stop a daemonized client
-with:
+startup errors are still reported in the foreground. Stop a daemonized Unix
+client with:
 
 ```bash
-ezvpn client stop --instance work
+sudo ezvpn client stop --instance work
 ```
 
 `ezvpn client status` prints connection state, assigned VPN IP/gateway, MTU,
@@ -289,7 +289,7 @@ config option.
 ```bash
 sudo ezvpn client start -c work.toml --instance work
 sudo ezvpn client start -c home.toml
-ezvpn client status --instance work
+sudo ezvpn client status --instance work
 ```
 
 Each running instance exposes a local control socket next to its lock file:
@@ -301,10 +301,11 @@ The runtime directory is machine-global: `/run/ezvpn` on Linux,
 `/var/run/ezvpn` on macOS, and `%ProgramData%\ezvpn` on Windows. Override it
 with `EZVPN_RUNTIME_DIR`.
 
-Run `status`, `list`, and `stop` as root/Administrator so they resolve the same
-runtime directory as the tunnel process. `client list` discovers instances by
-lock file and probes each control socket; stopped clients may briefly show as
-`not responding (stale lock)` until the lock file is reused or removed.
+Run `status` and `list` as root/Administrator so they resolve the same runtime
+directory as the tunnel process. On Unix, run `stop` the same way. `client list`
+discovers instances by lock file and probes each control socket; stopped clients
+may briefly show as `not responding (stale lock)` until the lock file is reused
+or removed.
 
 ## Routing
 
@@ -450,8 +451,8 @@ See the relay and discovery comments in `vpn_server.toml.example` and
 For unattended clients under systemd, launchd, or a Windows service, see
 [`docs/RUNNING-AS-A-SERVICE.md`](docs/RUNNING-AS-A-SERVICE.md).
 
-That guide also covers pinning the runtime directory so `status`, `list`, and
-`stop` resolve the same location used by the service.
+That guide also covers the fixed runtime directory used by `status`, `list`,
+and Unix `stop` under service managers.
 
 ## Architecture
 
