@@ -40,7 +40,7 @@ role = "vpnclient"
 # NOTE: Use either auth_token OR auth_token_file, not both.
 auth_token = "<YOUR_AUTH_TOKEN>"  # Replace with real token from generate-auth-token
 
-# Or use a file containing the token (one token, no comments)
+# Or use a file containing the token (one token, # comments allowed)
 # NOTE: Use either auth_token OR auth_token_file, not both.
 # auth_token_file = "~/.config/ezvpn/vpn-token.txt"
 

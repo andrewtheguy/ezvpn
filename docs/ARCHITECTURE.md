@@ -81,7 +81,7 @@ sequenceDiagram
 
     Note over S: Server startup
     S->>S: Create TUN device (tun0)
-    S->>S: Assign gateway IP(s) (10.0.0.1, fd00::1)
+    S->>S: Assign gateway IP(s) (10.0.0.1, fd00::1 in sequential IPv6 mode)
 
     Note over C: User runs ezvpn client
     C->>C: Acquire VPN lock
@@ -156,15 +156,16 @@ The VPN mode sends raw IP packets directly over iroh's unreliable QUIC datagrams
 
 **Device ID Generation:**
 
-The `device_id` is generated at startup with `rand::rng().random::<u64>()`. It is a random session identifier, not an authentication secret; authentication relies on iroh's endpoint identity plus the configured auth token.
+The `device_id` is generated at startup with `rand::rng().random::<u64>()`. It is a random session identifier, not an authentication secret; security relies on the ALPN knock token, the server's iroh endpoint identity, and the configured auth token.
 
 **Security Considerations:**
 
 The `device_id` is used **purely for session tracking** within an already-authenticated iroh connection—it is NOT used for access control. Security relies on:
-1. iroh's cryptographic `EndpointId` authentication
-2. Auth token validation
+1. the required ALPN token being embedded in the negotiated ALPN value
+2. iroh's cryptographic server `EndpointId` authentication and QUIC/TLS encryption
+3. Auth token validation
 
-Clients are keyed by `(EndpointId, device_id)`, so an attacker cannot hijack a session by guessing a `device_id` without also possessing the victim's iroh private key.
+Clients are keyed by `(EndpointId, device_id)`, so an attacker cannot hijack a session by guessing a `device_id` without also possessing the victim's iroh private key and valid shared credentials.
 
 **Collision Handling:**
 
@@ -184,10 +185,10 @@ Per-packet cost dominates tunnel throughput: every ~MTU-sized TCP segment otherw
 
 | Path | Local TUN has offload | Behavior |
 |------|----------------------|----------|
-| Egress, kernel GRO | yes (Linux) | Kernel hands coalesced super-frames + `virtio_net_hdr` to the TUN reader; forwarded with metadata when the peer accepts GSO, otherwise software-segmented (`materialize_offload_packet`) before framing |
+| Egress, kernel GRO | yes (Linux) | Kernel hands coalesced super-frames + `virtio_net_hdr` to the TUN reader; forwarded with metadata when the peer accepts GSO, otherwise software-segmented (`materialize_offload_into`) before framing |
 | Egress, software GRO | no (macOS/Windows, or Linux without vnet headers) | `TcpGroTable` (in `offload.rs`) coalesces consecutive in-order same-flow TCP segments into a super-frame with a synthetic `virtio_net_hdr`, then flushes when the TUN read side drains |
 | Ingress, kernel TSO | yes (Linux) | Offload-tagged frames are written to the TUN with their metadata; the kernel segments and completes checksums |
-| Ingress, software segmentation | no | `materialize_offload_packet` splits the super-frame into plain per-MSS packets with recomputed checksums before the TUN write |
+| Ingress, software segmentation | no | `materialize_offload_into` splits the super-frame into plain per-MSS packets with recomputed checksums before the TUN write |
 
 **Software GRO details** (`TcpGroTable`, mirrors wireguard-go's `tun/tcp_offload_linux.go` semantics):
 - Coalesces only clean in-order TCP: same flow key, contiguous sequence numbers, uniform MSS, byte-identical headers (TCP timestamps may advance; the latest is carried). SYN/RST/URG/CWR, pure ACKs, fragments and non-TCP packets pass through immediately — flushing any pending same-flow group first so in-flow ordering is preserved.
@@ -257,7 +258,7 @@ graph TB
     style D6 fill:#BBDEFB
 ```
 
-When both `network` and `network6` are configured, each client normally receives both an IPv4 and IPv6 address. If one family is exhausted in dual-stack mode, the server can still allocate the other family; if all configured pools are exhausted, the connection is rejected. If `network` is omitted, the IPv4 pool is not created and the server runs IPv6-only. The default IPv6 strategy allocates sequential /128 client addresses with release/reuse behavior similar to IPv4; `ip6_strategy = "node-id"` instead derives stable client IPv6 addresses from iroh node IDs and rejects duplicate derived addresses. With a /64, sequential IPv6 pool exhaustion is not a practical concern for normal deployments.
+When both `network` and `network6` are configured, each client normally receives both an IPv4 and IPv6 address. If one family is exhausted in dual-stack mode, the server can still allocate the other family; if all configured pools are exhausted, the connection is rejected. If `network` is omitted, the IPv4 pool is not created and the server runs IPv6-only. The default IPv6 strategy allocates sequential /128 client addresses with release/reuse behavior similar to IPv4; `ip6_strategy = "node-id"` instead derives stable client IPv6 addresses from client iroh node IDs, derives the server IPv6 address from the server `EndpointId`, and rejects duplicate derived addresses. With a /64, sequential IPv6 pool exhaustion is not a practical concern for normal deployments.
 
 ### Platform-Specific Details
 
