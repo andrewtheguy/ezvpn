@@ -429,14 +429,21 @@ impl VpnClient {
         // rides the already-bypassed relay, so VPN routes never black-hole iroh.
         let will_add_routes = (server_info.assigned_ip.is_some() && !self.config.routes.is_empty())
             || (server_info.assigned_ip6.is_some() && !self.config.routes6.is_empty());
-        let (bypass_route_task, server_addr_tx): (
-            Option<JoinHandle<()>>,
+        // Hold the bypass-manager task in an abort-on-drop guard: route
+        // installation below can early-return via `?` before `run_tunnel` takes
+        // ownership, and a dropped bare handle would leak the task rather than
+        // abort it. The guard is disarmed only when ownership passes onward.
+        let (bypass_route_guard, server_addr_tx): (
+            Option<AbortOnDropTask>,
             Option<mpsc::Sender<HashSet<IpAddr>>>,
         ) = if will_add_routes {
             let handles = self
                 .add_iroh_bypass_routes(endpoint, &connection, tun_device.name(), relay_urls)
                 .await;
-            (Some(handles.task), Some(handles.server_addr_tx))
+            (
+                Some(AbortOnDropTask::new(handles.task)),
+                Some(handles.server_addr_tx),
+            )
         } else {
             (None, None)
         };
@@ -539,8 +546,10 @@ impl VpnClient {
             );
         }
 
-        // Run the VPN packet loop (tunneled over iroh datagrams).
-        // Pass the bypass route task so it's aborted when VPN ends.
+        // Run the VPN packet loop (tunneled over iroh datagrams). Disarm the
+        // guard and hand the task to `run_tunnel`, which aborts it when the VPN
+        // ends. No `?` may appear between here and the call, or the task leaks.
+        let bypass_route_task = bypass_route_guard.map(AbortOnDropTask::disarm);
         let result = run_tunnel(
             tun_device,
             connection,
@@ -1507,6 +1516,35 @@ async fn capture_underlay_gateway(is_ipv6: bool) -> Option<UnderlayGateway> {
 struct BypassRouteHandles {
     task: JoinHandle<()>,
     server_addr_tx: mpsc::Sender<HashSet<IpAddr>>,
+}
+
+/// Aborts the wrapped task on drop unless it is disarmed first.
+///
+/// The bypass-manager task is spawned during connection setup, but its lifetime
+/// is owned by `run_tunnel` (which aborts and awaits it on exit). Between the
+/// spawn and that hand-off, route installation can fail and early-return;
+/// dropping a bare `JoinHandle` only *detaches* the task, leaking it — along with
+/// its route guards and connection clone — until the connection eventually
+/// closes. This guard aborts on drop so a setup error tears the task down.
+struct AbortOnDropTask(Option<JoinHandle<()>>);
+
+impl AbortOnDropTask {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// Take the handle, disarming the guard, to hand ownership to `run_tunnel`.
+    fn disarm(mut self) -> JoinHandle<()> {
+        self.0.take().expect("handle taken exactly once")
+    }
+}
+
+impl Drop for AbortOnDropTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// Run the event-driven bypass route manager task.
