@@ -84,11 +84,7 @@ fn platform_runtime_dir() -> PathBuf {
 
 #[cfg(all(not(test), target_os = "windows"))]
 fn platform_runtime_dir() -> PathBuf {
-    let base = std::env::var_os("ProgramData")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    base.join("ezvpn")
+    program_data_dir().join("ezvpn")
 }
 
 /// Directory for the daemon log file.
@@ -125,11 +121,29 @@ fn platform_log_dir() -> PathBuf {
 
 #[cfg(all(not(test), target_os = "windows"))]
 fn platform_log_dir() -> PathBuf {
-    let base = std::env::var_os("ProgramData")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    base.join("ezvpn").join("logs")
+    program_data_dir().join("ezvpn").join("logs")
+}
+
+/// Machine-global `ProgramData` base directory (Windows).
+///
+/// `ProgramData` is shared by all users (not a per-user profile location),
+/// which is what a LocalSystem service wants. Resolution order:
+///   1. the `%ProgramData%` env var (the documented override, present on every
+///      normal install and already pointing at the real install drive), then
+///   2. the Known Folders API (`SHGetKnownFolderPath(FOLDERID_ProgramData)`),
+///      which is authoritative in stripped service environments where the env
+///      var may be absent — and, like the env var, follows the actual install
+///      drive instead of assuming `C:\`.
+///
+/// The final `C:\ProgramData` literal is a last-ditch fallback only reached if
+/// both the env var is unset *and* the shell32 call fails.
+#[cfg(all(not(test), target_os = "windows"))]
+fn program_data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("ProgramData").filter(|s| !s.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    known_folders::get_known_folder_path(known_folders::KnownFolder::ProgramData)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
 }
 
 /// Names of the directory-override environment variables, checked by
