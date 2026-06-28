@@ -9,8 +9,12 @@ For a quick background run without a service manager, `client start --daemon`
 (Unix only) forks into the background and logs to
 `<log_dir>/ezvpn-client-<instance>.log` — the persistent log directory
 (`/var/log/ezvpn` on Linux and macOS), created owner-only on first run and
-overridable with `EZVPN_LOG_DIR`. Stop it with the **same** `--instance` it was
-started with, e.g.:
+overridable with `EZVPN_LOG_DIR`. This log is size-capped: it rotates to a
+single `<name>.log.1` backup at 10 MiB (override the cap in bytes with
+`EZVPN_LOG_MAX_BYTES`), bounding disk use at ~20 MiB per instance. (Under a
+service manager the foreground form is used instead, and the
+service manager handles log capture and rotation — see below.) Stop it with the
+**same** `--instance` it was started with, e.g.:
 
 ```bash
 sudo ezvpn client start --daemon -c /etc/ezvpn/work.toml --instance work

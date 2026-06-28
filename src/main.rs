@@ -205,7 +205,8 @@ enum ClientAction {
         instance: String,
 
         /// Run in the background as a daemon (Unix only). Logs are written to
-        /// <log_dir>/ezvpn-client-<instance>.log.
+        /// <log_dir>/ezvpn-client-<instance>.log, size-capped at 10 MiB
+        /// (EZVPN_LOG_MAX_BYTES) with one rotated <name>.log.1 backup.
         #[arg(long)]
         daemon: bool,
     },
@@ -551,28 +552,160 @@ fn canonicalize_client_paths(resolved: &mut ResolvedVpnClientConfig) -> Result<(
     Ok(())
 }
 
+/// Default maximum size (bytes) of the active daemon log before it is rotated.
+/// On reaching the cap the current log is renamed to `<name>.1` (replacing any
+/// previous backup) and a fresh log is started, so disk use stays bounded at
+/// roughly `2 *` the cap. Override with `EZVPN_LOG_MAX_BYTES`.
+#[cfg(unix)]
+const DAEMON_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Resolve the daemon log size cap, honoring the `EZVPN_LOG_MAX_BYTES`
+/// environment variable (bytes) and falling back to [`DAEMON_LOG_MAX_BYTES`].
+/// Called before the logger is installed and the fork, so warnings reach the
+/// foreground stderr.
+#[cfg(unix)]
+fn daemon_log_max_bytes() -> u64 {
+    parse_log_max_bytes(std::env::var_os("EZVPN_LOG_MAX_BYTES").as_deref())
+}
+
+/// Parse a raw `EZVPN_LOG_MAX_BYTES` value into a byte cap. `None`, empty, and
+/// invalid/zero values fall back to [`DAEMON_LOG_MAX_BYTES`]; invalid (non-empty)
+/// values also warn to stderr.
+#[cfg(unix)]
+fn parse_log_max_bytes(raw: Option<&std::ffi::OsStr>) -> u64 {
+    let Some(raw) = raw.filter(|r| !r.is_empty()) else {
+        return DAEMON_LOG_MAX_BYTES;
+    };
+    match raw.to_str().and_then(|s| s.trim().parse::<u64>().ok()) {
+        Some(n) if n > 0 => n,
+        _ => {
+            eprintln!(
+                "ezvpn: ignoring invalid EZVPN_LOG_MAX_BYTES={}; using default {} bytes",
+                raw.to_string_lossy(),
+                DAEMON_LOG_MAX_BYTES
+            );
+            DAEMON_LOG_MAX_BYTES
+        }
+    }
+}
+
 /// Fork the current process into the background as a daemon (Unix only). Must
-/// be called before the Tokio runtime is built. Sets `chdir("/")` and redirects
-/// stdout/stderr to `log_path`; the parent process exits inside `start()`.
+/// be called before the Tokio runtime is built. Sets `chdir("/")` and routes
+/// stdout/stderr through a pipe drained by a background thread that writes to a
+/// size-capped, rotating log at `log_path` (see [`DAEMON_LOG_MAX_BYTES`]). The
+/// parent process exits inside `start()`.
+///
+/// The pipe is needed because daemonization `dup2`s the daemon's stdout/stderr
+/// directly onto the log file; writing that way is unbounded. Draining the fds
+/// in-process lets us enforce the cap while still capturing everything the
+/// daemon emits (log lines, panics, library stdout/stderr).
 #[cfg(unix)]
 fn daemonize_client(log_path: &Path) -> Result<()> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
     // The log lives in the log dir, which may not exist on first run.
     lock::ensure_log_dir().context("creating log directory for daemon log")?;
-    let out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .with_context(|| format!("opening daemon log file {}", log_path.display()))?;
-    let err = out
-        .try_clone()
-        .context("cloning daemon log file handle")?;
+
+    // Resolve the cap before the fork so any warning lands on the foreground
+    // terminal rather than (post-redirect) in the log file itself.
+    let max_bytes = daemon_log_max_bytes();
+
+    // Self-pipe: the daemon's stdout/stderr become the write end; a background
+    // thread (spawned post-fork) reads the read end and writes the capped log.
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a valid 2-element array for `pipe` to populate.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("creating daemon log pipe");
+    }
+    // SAFETY: `pipe` succeeded, so both fds are open and now owned by us.
+    let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+
+    // stdout and stderr each need their own handle onto the write end; both are
+    // moved into daemonize, which `dup2`s them onto fd 1/2 and drops these
+    // copies. The only surviving write ends are then fd 1/2 in the daemon, so
+    // the reader sees EOF exactly when the daemon exits.
+    let stdout = std::fs::File::from(
+        write_end
+            .try_clone()
+            .context("cloning daemon log pipe write end")?,
+    );
+    let stderr = std::fs::File::from(write_end);
+
     daemonix::Daemonize::new()
         .working_directory("/")
-        .stdout(out)
-        .stderr(err)
+        .stdout(stdout)
+        .stderr(stderr)
         .start()
         .context("failed to daemonize")?;
+
+    // Post-fork, single-threaded daemon: drain the pipe into the capped log on
+    // a dedicated thread. It is detached and lives for the daemon's lifetime,
+    // exiting on EOF when the daemon closes stdout/stderr at shutdown.
+    let read_file = std::fs::File::from(read_end);
+    let path = log_path.to_path_buf();
+    std::thread::Builder::new()
+        .name("ezvpn-logwriter".into())
+        .spawn(move || drain_to_capped_log(read_file, &path, max_bytes))
+        .context("spawning daemon log writer thread")?;
+
     Ok(())
+}
+
+/// Path of the single rotation backup: the active log name with `.1` appended
+/// (e.g. `ezvpn-client-default.log` -> `ezvpn-client-default.log.1`).
+#[cfg(unix)]
+fn rotated_log_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".1");
+    path.with_file_name(name)
+}
+
+/// Drain `pipe` (the daemon's redirected stdout/stderr) into a size-capped log
+/// at `path`, rotating to `<path>.1` when the active file would exceed
+/// `max_bytes`. Runs on a dedicated thread for the daemon's lifetime and
+/// returns when the pipe reaches EOF (daemon shutdown).
+#[cfg(unix)]
+fn drain_to_capped_log(mut pipe: std::fs::File, path: &Path, max_bytes: u64) {
+    use std::io::{Read, Write};
+
+    let open_active = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    };
+    let Ok(mut file) = open_active() else { return };
+    let mut size = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+    // Chunks are at most `buf.len()`, so a rotated file never exceeds
+    // `max_bytes + buf.len()`.
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = match pipe.read(&mut buf) {
+            Ok(0) => return, // EOF: the daemon is exiting.
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+
+        // Rotate before writing if this chunk would breach the cap. Skip when
+        // the active file is still empty (can't rotate a fresh file usefully).
+        if size > 0
+            && size + n as u64 > max_bytes
+            && std::fs::rename(path, rotated_log_path(path)).is_ok()
+            && let Ok(fresh) = open_active()
+        {
+            file = fresh;
+            size = 0;
+        }
+
+        // Best-effort: on a write error, keep draining so the pipe never fills
+        // and blocks the daemon's logging.
+        if file.write_all(&buf[..n]).is_ok() {
+            size += n as u64;
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -911,5 +1044,79 @@ async fn run_vpn_client(
             log::info!("Received shutdown signal, stopping VPN client");
             Ok(())
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    #[test]
+    fn parse_log_max_bytes_handles_overrides_and_fallbacks() {
+        use std::ffi::OsStr;
+        // Valid positive value is honored (whitespace trimmed).
+        assert_eq!(parse_log_max_bytes(Some(OsStr::new("4096"))), 4096);
+        assert_eq!(parse_log_max_bytes(Some(OsStr::new("  4096 "))), 4096);
+        // Unset, empty, zero, and unparsable all fall back to the default.
+        assert_eq!(parse_log_max_bytes(None), DAEMON_LOG_MAX_BYTES);
+        assert_eq!(parse_log_max_bytes(Some(OsStr::new(""))), DAEMON_LOG_MAX_BYTES);
+        assert_eq!(parse_log_max_bytes(Some(OsStr::new("0"))), DAEMON_LOG_MAX_BYTES);
+        assert_eq!(
+            parse_log_max_bytes(Some(OsStr::new("not-a-number"))),
+            DAEMON_LOG_MAX_BYTES
+        );
+        assert_eq!(parse_log_max_bytes(Some(OsStr::new("-5"))), DAEMON_LOG_MAX_BYTES);
+    }
+
+    #[test]
+    fn rotated_log_path_appends_suffix() {
+        assert_eq!(
+            rotated_log_path(Path::new("/var/log/ezvpn/ezvpn-client-default.log")),
+            PathBuf::from("/var/log/ezvpn/ezvpn-client-default.log.1")
+        );
+    }
+
+    // Feed more than the cap through the pipe and confirm the writer rotates to
+    // a single `.log.1` backup and bounds each file's size.
+    #[test]
+    fn drain_caps_and_rotates() {
+        let dir = std::env::temp_dir().join(format!("ezvpn-logtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("ezvpn-client-default.log");
+
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let mut write_end = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fds[1]) });
+
+        let max_bytes: u64 = 4 * 1024;
+        let reader = {
+            let path = log_path.clone();
+            std::thread::spawn(move || {
+                drain_to_capped_log(std::fs::File::from(read_end), &path, max_bytes);
+            })
+        };
+
+        // Write far more than the pipe buffer (~64KiB) so the reader drains in
+        // several 16KiB reads and rotation is exercised (rotation is per-read).
+        let chunk = vec![b'x'; 1024];
+        for _ in 0..256 {
+            write_end.write_all(&chunk).unwrap();
+        }
+        // Closing the write end signals EOF so the reader thread returns.
+        drop(write_end);
+        reader.join().unwrap();
+
+        let active = std::fs::metadata(&log_path).expect("active log exists");
+        let backup =
+            std::fs::metadata(rotated_log_path(&log_path)).expect("rotated backup exists");
+        // Each file is bounded by the cap plus at most one buffer chunk.
+        let bound = max_bytes + 16 * 1024;
+        assert!(active.len() <= bound, "active {} too big", active.len());
+        assert!(backup.len() <= bound, "backup {} too big", backup.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

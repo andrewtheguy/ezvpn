@@ -303,7 +303,10 @@ and is machine-global: `/run/ezvpn` on Linux, `/var/run/ezvpn` on macOS, and
 
 The daemon log is kept separately in the persistent log directory: `/var/log/ezvpn`
 on Linux and macOS, and `%ProgramData%\ezvpn\logs` on Windows. Override it with
-`EZVPN_LOG_DIR`.
+`EZVPN_LOG_DIR`. The log is size-capped: at 10 MiB it rotates to a single
+`<name>.log.1` backup (replacing any previous one), so disk use stays bounded at
+roughly 20 MiB per instance. Override the cap (in bytes) with
+`EZVPN_LOG_MAX_BYTES`.
 
 Run `status` and `list` as root/Administrator so they resolve the same runtime
 directory as the tunnel process. On Unix, run `stop` the same way. `client list`
