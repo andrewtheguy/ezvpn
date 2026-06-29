@@ -318,7 +318,9 @@ impl VpnHandshakeResponse {
     /// Builder-style so the per-family constructors stay unchanged; a no-op on a
     /// rejected response (the client ignores everything but `reject_reason`).
     pub fn with_server_addrs(mut self, server_addrs: Vec<IpAddr>) -> Self {
-        self.server_addrs = server_addrs;
+        if self.accepted {
+            self.server_addrs = server_addrs;
+        }
         self
     }
 

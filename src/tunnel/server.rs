@@ -2220,10 +2220,28 @@ fn server_candidate_addrs(
         // overlay addresses, never transport underlay, so never bypass candidates;
         // publishing them would make clients pin the VPN gateway off the tunnel.
         .filter(|ip| !ip_in_overlay(*ip, overlay_v4, overlay_v6))
+        // Loopback, unspecified, and link-local addresses are local-only or
+        // scope-bound; they can never be a transport underlay a client reaches
+        // the server on, so they must not become bypass candidates either.
+        .filter(|ip| is_routable_underlay(*ip))
         .collect();
     addrs.sort_unstable();
     addrs.dedup();
     addrs
+}
+
+/// True if `ip` can plausibly be a transport underlay address a client reaches
+/// the server on — i.e. not loopback, unspecified, or link-local (scope-bound).
+fn is_routable_underlay(ip: IpAddr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => !v4.is_link_local(),
+        // `Ipv6Addr::is_unicast_link_local` is unstable, so match the fe80::/10
+        // prefix directly.
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
+    }
 }
 
 /// True if `ip` falls within the server's own VPN overlay network (the tun

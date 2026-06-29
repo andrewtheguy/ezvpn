@@ -569,16 +569,17 @@ impl VpnClient {
             );
         }
 
-        // Run the VPN packet loop (tunneled over iroh datagrams). Disarm the
-        // guard and hand the task to `run_tunnel`, which aborts it when the VPN
-        // ends. No `?` may appear between here and the call, or the task leaks.
-        let bypass_route_task = bypass_route_guard.map(AbortOnDropTask::disarm);
+        // Run the VPN packet loop (tunneled over iroh datagrams). Hand the still-
+        // armed guard to `run_tunnel`, which disarms it only after its own setup
+        // can no longer return early (past `tun_device.split()`); until then the
+        // guard keeps aborting the bypass task on any early exit. `run_tunnel`
+        // aborts the task when the VPN ends.
         let result = run_tunnel(
             tun_device,
             connection,
             server_info.server_gso_enabled,
             max_datagram_size,
-            bypass_route_task,
+            bypass_route_guard,
             server_addr_tx,
             local_iroh_udp_ports,
         )
@@ -877,12 +878,15 @@ pub(crate) async fn run_tunnel(
     connection: Connection,
     server_gso_enabled: bool,
     max_datagram_size: usize,
-    bypass_route_task: Option<JoinHandle<()>>,
+    bypass_route_guard: Option<AbortOnDropTask>,
     server_addr_tx: Option<mpsc::Sender<HashSet<IpAddr>>>,
     local_iroh_udp_ports: Arc<HashSet<u16>>,
 ) -> VpnResult<()> {
-    // Split TUN device
+    // Split TUN device. This is the last point setup can return early, so the
+    // bypass guard stays armed across it; once the split succeeds we disarm it
+    // into a bare handle that the cleanup path below aborts when the VPN ends.
     let (mut tun_reader, mut tun_writer) = tun_device.split()?;
+    let bypass_route_task = bypass_route_guard.map(AbortOnDropTask::disarm);
     let local_gso_enabled = tun_reader.offload_status().enabled;
     debug_assert_eq!(local_gso_enabled, tun_writer.offload_status().enabled);
     let negotiated_gso = local_gso_enabled && server_gso_enabled;
@@ -1575,7 +1579,7 @@ struct BypassRouteHandles {
 /// dropping a bare `JoinHandle` only *detaches* the task, leaking it — along with
 /// its route guards — until the data path eventually ends. This guard aborts on
 /// drop so a setup error tears the task down.
-struct AbortOnDropTask(Option<JoinHandle<()>>);
+pub(crate) struct AbortOnDropTask(Option<JoinHandle<()>>);
 
 impl AbortOnDropTask {
     fn new(handle: JoinHandle<()>) -> Self {
@@ -1662,8 +1666,10 @@ async fn collect_relay_ips(endpoint: &Endpoint, relay_urls: &[String]) -> HashSe
 ///
 /// Returns:
 /// - `Ok(addresses)` on successful resolution (may be empty if host has no addresses)
-/// - `Err(())` if DNS resolution failed (caller skips this relay and retries it
-///   on a later path snapshot; other addresses in the snapshot are unaffected)
+/// - `Err(())` if DNS resolution failed; the caller simply skips this relay (the
+///   other relays it resolves are unaffected). There is no retry — the connection
+///   still rides whichever relay it selects, and the server's published address
+///   set covers the direct underlay path.
 async fn resolve_relay_url(
     endpoint: &Endpoint,
     relay_url: &RelayUrl,
