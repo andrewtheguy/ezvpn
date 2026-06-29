@@ -385,9 +385,10 @@ the identical thing, but the transport endpoint is **not** a single static IP yo
 configured — iroh discovers it at runtime and may use several of the server's
 addresses (IPv4 *and* IPv6) and fall back to public **relay servers**. So instead
 of one hand-configured bypass you can see, `ezvpn` pins a *set* of addresses: the
-server's dynamically-discovered direct addresses, together with the resolved IPs
-of its preconfigured list of relays. That larger, runtime-determined set is
-exactly why the effect is easy to miss and worth spelling out below.
+server's own underlay addresses, which the server **publishes to the client**
+over the connection, together with the resolved IPs of the client's preconfigured
+list of relays. That larger, runtime-determined set is exactly why the effect is
+easy to miss and worth spelling out below.
 
 This affects **only that one transport address — not the rest of the prefix.**
 Other hosts inside the same routed CIDR still route through the VPN normally; only
@@ -417,12 +418,15 @@ address** (the server/peer's address inside the VPN subnet, e.g. `10.99.0.1` /
 for tunnel transport and using VPN IPs for actual traffic avoids the ambiguity
 entirely.
 
-> Earlier versions tried to *remove* the bypass route whenever iroh dropped that
-> peer from its path set, in an attempt to restore direct access to the public
-> address. Because iroh flaps underlay peers in and out of its path snapshots,
-> this caused the route to churn (repeated add/remove), and between removals the
-> address was self-captured into the tunnel — flaky for both uses. The bypass is
-> now stable for the session; use the VPN IP for in-tunnel access.
+> Earlier versions discovered the address by watching iroh's per-connection path
+> snapshots and tried to *remove* the bypass when the peer dropped out of the set.
+> Because iroh flaps underlay peers in and out of those snapshots, this both
+> missed addresses that appeared only briefly and churned the route (repeated
+> add/remove), self-capturing the address into the tunnel between removals. The
+> server now **publishes** its underlay addresses to the client directly, and the
+> bypass is stable for the session; use the VPN IP for in-tunnel access. (Pinning
+> the server's *direct* address requires a server built with this feature; older
+> servers still bypass relays only.)
 
 ## Protocol, MTU, and GSO
 
