@@ -345,13 +345,20 @@ cross-platform layer (`update` and `resolve_bypass_route_info`); the
 per-platform code (`add_bypass_route_impl`) only issues the single host-route
 add, so the behavior is identical on Linux, macOS, and Windows.
 
-Only the addresses iroh actually uses for transport are ever bypassed: the
-manager's required set is the resolved relay set plus the server's published
-candidate underlay addresses — never arbitrary destinations. So a bypass pins
-**only those transport endpoints, not the rest of the routed prefix**: other
-hosts inside the same CIDR still route through the VPN normally. In a full tunnel
-(`0.0.0.0/0`/`::/0`) the server and relay addresses are always covered and thus
-always pinned; in a split tunnel only an endpoint that overlaps a routed CIDR is.
+Only addresses iroh *may use* for transport are ever bypassed: the manager's
+required set is the resolved relay set plus the server's published candidate
+underlay addresses — never arbitrary destinations. That candidate set is the
+server's full address enumeration (both families, **public and private** — a peer
+on the same private network reaches the server over its private address), so it
+legitimately includes private/LAN addresses; which one a given client actually
+uses depends on where it connects from. The server **excludes its own VPN overlay
+addresses** (its tun-subnet gateway, e.g. `10.99.0.1` / `fd11:…::1`) from the set:
+those are overlay, never underlay transport, so pinning them off the tunnel would
+be wrong (`server_candidate_addrs` in `tunnel/server.rs`). A bypass pins **only those transport
+endpoints, not the rest of the routed prefix**: other hosts inside the same CIDR
+still route through the VPN normally. In a full tunnel (`0.0.0.0/0`/`::/0`) the
+server and relay addresses are always covered and thus always pinned; in a split
+tunnel only an endpoint that overlaps a routed CIDR is.
 
 **Caveat (user-visible).** As a consequence, the one address used for tunnel
 transport is reachable only over the underlay, not through the VPN, while the
@@ -372,8 +379,10 @@ instead. This is documented for end users in the README "Routing" section.
 
 The server is the authoritative source of its own underlay addresses, so it
 publishes them to each connected client instead of having the client guess from
-iroh path snapshots. The candidate IP set comes from `endpoint.addr()` and
-reaches the client two ways:
+iroh path snapshots. The candidate IP set comes from `endpoint.addr()`, minus the
+server's own VPN overlay addresses (iroh enumerates every local interface,
+including the server's tun, so its overlay gateway is filtered out — see
+`server_candidate_addrs`). It reaches the client two ways:
 
 - **At onboarding, in the handshake response** (`VpnHandshakeResponse.server_addrs`,
   reliable bi-stream). The client seeds these into its bypass manager during

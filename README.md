@@ -366,14 +366,17 @@ the host route is pinned with `New-NetRoute`.
 
 ### Caveat: the transport endpoint address is pinned off the tunnel
 
-The bypass route is installed **only for the exact address iroh uses to carry
-the tunnel** — the server's underlay address, plus any relay the connection
-falls back to — and **only when that address happens to fall inside one of your
-routed CIDRs**. A common example is the server's AWS public IPv6 when you route a
-`2600:1f13:adc::/…` prefix that contains it. `ezvpn` pins a `/32`/`/128` bypass
-host route for that single address so the QUIC tunnel's own underlay packets are
-not fed back into the tunnel (which would deadlock the connection). The bypass is
-installed for the lifetime of the session and is **not** removed mid-session.
+The bypass routes are installed for the addresses iroh **may use to carry the
+tunnel** — the server's *candidate* underlay addresses (every address iroh
+enumerates, across IPv4 *and* IPv6 and including **private** ones — a peer that
+connects from the same private network uses the private address for transport),
+plus any relay the connection can fall back to — and **only for those that fall
+inside one of your routed CIDRs**. A common example is the server's AWS public
+IPv6 when you route a `2600:1f13:adc::/…` prefix that contains it. `ezvpn` pins a
+`/32`/`/128` bypass host route for each such address so the QUIC tunnel's own
+underlay packets are not fed back into the tunnel (which would deadlock the
+connection). The bypasses are installed for the lifetime of the session and are
+**not** removed mid-session.
 
 **This is the same principle as any traditional VPN** — it just has less
 visibility here. A conventional client (OpenVPN, WireGuard, IPsec) must also keep
@@ -390,9 +393,9 @@ over the connection, together with the resolved IPs of the client's preconfigure
 list of relays. That larger, runtime-determined set is exactly why the effect is
 easy to miss and worth spelling out below.
 
-This affects **only that one transport address — not the rest of the prefix.**
+This affects **only those transport addresses — not the rest of the prefix.**
 Other hosts inside the same routed CIDR still route through the VPN normally; only
-the address iroh is actively using as its underlay endpoint is pinned. (In a full
+the server's candidate underlay addresses (and relays) are pinned. (In a full
 tunnel, `0.0.0.0/0`/`::/0` covers everything, so the server and relay addresses
 are always pinned — but those are iroh infrastructure, not resources you address
 directly.)

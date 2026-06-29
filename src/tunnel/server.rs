@@ -904,12 +904,15 @@ impl VpnServer {
         let node_id = endpoint.id().to_string();
         let status_server = server.clone();
         let status_endpoint = endpoint.clone();
+        let status_overlay_v4 = server.config.network;
+        let status_overlay_v6 = server.config.network6;
         let _status_listener =
             crate::control::spawn_status_listener(LockRole::Server, "default", move || {
-                let bypass_addrs = server_candidate_addrs(&status_endpoint)
-                    .iter()
-                    .map(|ip| ip.to_string())
-                    .collect();
+                let bypass_addrs =
+                    server_candidate_addrs(&status_endpoint, status_overlay_v4, status_overlay_v6)
+                        .iter()
+                        .map(|ip| ip.to_string())
+                        .collect();
                 status_server.status_snapshot(
                     node_id.clone(),
                     started_at.elapsed().as_secs(),
@@ -1222,8 +1225,13 @@ impl VpnServer {
         // VPN route would capture immediately, rather than waiting for the first
         // periodic data-path publication (`run_server_addr_publisher`). The client
         // filters to VPN-covered IPs and only ever adds, so publishing the full
-        // set — including private/LAN addresses — is safe.
-        let response = response.with_server_addrs(server_candidate_addrs(&endpoint));
+        // underlay set — including private/LAN addresses — is safe;
+        // `server_candidate_addrs` drops our own VPN overlay addresses.
+        let response = response.with_server_addrs(server_candidate_addrs(
+            &endpoint,
+            self.config.network,
+            self.config.network6,
+        ));
 
         write_message(send, &response.encode()?).await?;
         if let Err(e) = send.finish() {
@@ -1329,12 +1337,16 @@ impl VpnServer {
         let publisher_tx = packet_tx.clone();
         let publisher_conn = connection.clone();
         let publisher_label = remote_id.to_string();
+        let publisher_overlay_v4 = self.config.network;
+        let publisher_overlay_v6 = self.config.network6;
         tokio::spawn(async move {
             run_server_addr_publisher(
                 publisher_endpoint,
                 publisher_conn,
                 publisher_tx,
                 publisher_label,
+                publisher_overlay_v4,
+                publisher_overlay_v6,
             )
             .await;
         });
@@ -2194,11 +2206,33 @@ fn collect_local_iroh_udp_ports(endpoint: &Endpoint) -> HashSet<u16> {
 /// The server's candidate iroh underlay addresses (deduped, sorted): the set it
 /// advertises to clients for bypass routing, in the handshake and over the data
 /// path. Shared by the handshake response, the periodic publisher, and `status`.
-fn server_candidate_addrs(endpoint: &Endpoint) -> Vec<IpAddr> {
-    let mut addrs: Vec<IpAddr> = endpoint.addr().ip_addrs().map(|sa| sa.ip()).collect();
+fn server_candidate_addrs(
+    endpoint: &Endpoint,
+    overlay_v4: Option<Ipv4Net>,
+    overlay_v6: Option<Ipv6Net>,
+) -> Vec<IpAddr> {
+    let mut addrs: Vec<IpAddr> = endpoint
+        .addr()
+        .ip_addrs()
+        .map(|sa| sa.ip())
+        // iroh enumerates every local interface, which includes the server's own
+        // VPN tun (e.g. the overlay gateway 10.99.0.1 / fd11:…::1). Those are
+        // overlay addresses, never transport underlay, so never bypass candidates;
+        // publishing them would make clients pin the VPN gateway off the tunnel.
+        .filter(|ip| !ip_in_overlay(*ip, overlay_v4, overlay_v6))
+        .collect();
     addrs.sort_unstable();
     addrs.dedup();
     addrs
+}
+
+/// True if `ip` falls within the server's own VPN overlay network (the tun
+/// subnet), and therefore must not be advertised as an underlay bypass candidate.
+fn ip_in_overlay(ip: IpAddr, overlay_v4: Option<Ipv4Net>, overlay_v6: Option<Ipv6Net>) -> bool {
+    match ip {
+        IpAddr::V4(v4) => overlay_v4.is_some_and(|net| net.contains(&v4)),
+        IpAddr::V6(v6) => overlay_v6.is_some_and(|net| net.contains(&v6)),
+    }
 }
 
 /// Publish the server's current candidate underlay addresses to one client over
@@ -2212,8 +2246,10 @@ async fn publish_server_addrs(
     endpoint: &Endpoint,
     packet_tx: &mpsc::Sender<Bytes>,
     label: &str,
+    overlay_v4: Option<Ipv4Net>,
+    overlay_v6: Option<Ipv6Net>,
 ) -> Result<(), ()> {
-    let addrs = server_candidate_addrs(endpoint);
+    let addrs = server_candidate_addrs(endpoint, overlay_v4, overlay_v6);
     if addrs.is_empty() {
         // No direct addresses discovered yet; nothing to bypass.
         return Ok(());
@@ -2250,6 +2286,8 @@ async fn run_server_addr_publisher(
     connection: Connection,
     packet_tx: mpsc::Sender<Bytes>,
     label: String,
+    overlay_v4: Option<Ipv4Net>,
+    overlay_v6: Option<Ipv6Net>,
 ) {
     // The first `tick()` resolves immediately, giving the eager initial publish.
     let mut interval = tokio::time::interval(SERVER_ADDR_PUBLISH_INTERVAL);
@@ -2260,14 +2298,14 @@ async fn run_server_addr_publisher(
         tokio::select! {
             _ = connection.closed() => break,
             _ = interval.tick() => {
-                if publish_server_addrs(&endpoint, &packet_tx, &label).await.is_err() {
+                if publish_server_addrs(&endpoint, &packet_tx, &label, overlay_v4, overlay_v6).await.is_err() {
                     break;
                 }
             }
             changed = addr_changes.next(), if watcher_alive => {
                 match changed {
                     Some(_) => {
-                        if publish_server_addrs(&endpoint, &packet_tx, &label).await.is_err() {
+                        if publish_server_addrs(&endpoint, &packet_tx, &label, overlay_v4, overlay_v6).await.is_err() {
                             break;
                         }
                     }
@@ -3133,5 +3171,44 @@ mod tests {
         assert_eq!(stats.tun_packets_read.load(Ordering::Relaxed), 10000);
         assert_eq!(stats.packets_to_clients.load(Ordering::Relaxed), 10000);
         assert_eq!(stats.packets_no_route.load(Ordering::Relaxed), 10000);
+    }
+
+    #[test]
+    fn test_ip_in_overlay_excludes_only_vpn_overlay() {
+        let v4: Ipv4Net = "10.99.0.0/24".parse().unwrap();
+        let v6: Ipv6Net = "fd11:9a0b:1095:99::/64".parse().unwrap();
+
+        // The server's own VPN overlay gateway must be treated as overlay.
+        assert!(ip_in_overlay(
+            "10.99.0.1".parse().unwrap(),
+            Some(v4),
+            Some(v6)
+        ));
+        assert!(ip_in_overlay(
+            "fd11:9a0b:1095:99::1".parse().unwrap(),
+            Some(v4),
+            Some(v6)
+        ));
+
+        // Real underlay addresses (public or private LAN) are NOT overlay: a peer
+        // on that private network legitimately uses them for transport.
+        assert!(!ip_in_overlay(
+            "172.31.150.233".parse().unwrap(),
+            Some(v4),
+            Some(v6)
+        ));
+        assert!(!ip_in_overlay(
+            "44.230.20.120".parse().unwrap(),
+            Some(v4),
+            Some(v6)
+        ));
+        assert!(!ip_in_overlay(
+            "2600:1f13:adc:a0b1:feb9:cb56:f64e:b6f8".parse().unwrap(),
+            Some(v4),
+            Some(v6)
+        ));
+
+        // With no overlay configured, nothing is excluded.
+        assert!(!ip_in_overlay("10.99.0.1".parse().unwrap(), None, None));
     }
 }
