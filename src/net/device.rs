@@ -3,8 +3,20 @@
 //! This module handles creating and managing TUN network interfaces
 //! for VPN traffic.
 
+// Darwin (macOS + iOS) share the direct `utun` fd I/O path (4-byte
+// address-family-prefixed frames). The discriminator is `target_vendor =
+// "apple"`. The `not(target_vendor = "apple")` arms select the `tun`-crate
+// reader/writer path used on Linux/Windows. The macОS-only TUN *creation*,
+// route, and `ifconfig` code below stays gated on `target_os = "macos"` — iOS
+// neither creates a utun nor configures routes (the NEPacketTunnelProvider
+// does), so it only reuses the shared fd I/O.
+//
+// On iOS the device is built from an OS-provided fd (`TunDevice::from_raw_fd`),
+// so the `tun`-crate creation imports are unused there; silence the noise.
+#![cfg_attr(target_os = "ios", allow(unused_imports, dead_code))]
+
 use crate::error::{VpnError, VpnResult};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 use crate::tunnel::offload::compose_tun_frame;
 use crate::tunnel::offload::{
     VIRTIO_NET_HDR_LEN, assemble_tcp_gso_superframe, plan_tun_write_groups, split_tun_frame,
@@ -12,30 +24,30 @@ use crate::tunnel::offload::{
 use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
 use ipnet::{Ipv4Net, Ipv6Net};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 use std::pin::Pin;
 use tokio::io::ReadBuf;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::process::Command;
 use tun::{AbstractDevice, AsyncDevice, Configuration};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 use tun::{DeviceReader, DeviceWriter};
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use std::io;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use std::os::fd::AsRawFd;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use std::sync::Arc;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use tokio::io::Interest;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use tokio::io::unix::AsyncFd;
 
 /// TUN device configuration.
@@ -185,8 +197,14 @@ impl TunOffloadStatus {
 
 /// A managed TUN device with async I/O.
 pub struct TunDevice {
-    /// The underlying async TUN device.
+    /// The underlying async TUN device (desktop: created by the `tun` crate).
+    #[cfg(not(target_os = "ios"))]
     device: AsyncDevice,
+    /// iOS: the OS-provided `utun` fd handed to us by the
+    /// `NEPacketTunnelProvider`. We own a `dup` of it; [`Self::split`] dups
+    /// again for the reader/writer halves.
+    #[cfg(target_os = "ios")]
+    fd: OwnedFd,
     /// Device name.
     name: String,
     /// Configured MTU.
@@ -199,6 +217,10 @@ pub struct TunDevice {
 
 impl TunDevice {
     /// Create a new TUN device with the given configuration.
+    ///
+    /// Desktop-only: iOS receives an already-created `utun` fd from the
+    /// Network Extension and must use [`Self::from_raw_fd`] instead.
+    #[cfg(not(target_os = "ios"))]
     pub fn create(config: TunConfig) -> VpnResult<Self> {
         let mut tun_config = Configuration::default();
 
@@ -266,6 +288,29 @@ impl TunDevice {
         })
     }
 
+    /// Wrap an OS-provided `utun` file descriptor (iOS Network Extension).
+    ///
+    /// The `NEPacketTunnelProvider` creates the tunnel interface and configures
+    /// its addresses/routes/MTU via `NEPacketTunnelNetworkSettings`; it then
+    /// exposes the underlying `utun` fd. This constructor takes ownership of a
+    /// `dup` of that fd and drives it with the shared Darwin fast path (4-byte
+    /// address-family-prefixed frames — the same format macOS `utun` uses).
+    ///
+    /// No offload: iOS has no kernel GSO, so the data path uses software GRO,
+    /// exactly like macOS.
+    #[cfg(target_os = "ios")]
+    pub fn from_raw_fd(fd: RawFd, mtu: u16) -> VpnResult<Self> {
+        // Own a private dup so our lifetime is independent of the caller's fd.
+        let owned = duplicate_fd(fd)?;
+        Ok(Self {
+            fd: owned,
+            name: "utun-ios".to_string(),
+            mtu,
+            vnet_hdr_enabled: false,
+            offload_status: TunOffloadStatus::disabled("iOS utun has no kernel offload"),
+        })
+    }
+
     /// Get the device name.
     pub fn name(&self) -> &str {
         &self.name
@@ -288,13 +333,23 @@ impl TunDevice {
     /// Split the device into read and write halves.
     /// Note: The tun crate returns (writer, reader) order from split().
     pub fn split(self) -> VpnResult<(TunReader, TunWriter)> {
-        // Save buffer_size before moving self.device
+        // Save buffer_size before moving the device/fd.
         let buffer_size = self.buffer_size();
 
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         {
-            let DarwinTunHalves { reader, writer } = DarwinTunHalves::new(&self.device)?;
+            // Source the raw fd from whichever backing store this platform uses:
+            // the `tun`-crate device on macOS, the OS-provided fd on iOS.
+            #[cfg(not(target_os = "ios"))]
+            let raw_fd = self.device.as_raw_fd();
+            #[cfg(target_os = "ios")]
+            let raw_fd = self.fd.as_raw_fd();
+
+            let DarwinTunHalves { reader, writer } = DarwinTunHalves::from_raw_fd(raw_fd)?;
+            // The halves hold their own dup of the fd; release our handle.
+            #[cfg(not(target_os = "ios"))]
             drop(self.device);
+
             Ok((
                 TunReader {
                     inner: TunReaderInner::Darwin(reader),
@@ -313,7 +368,7 @@ impl TunDevice {
             ))
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         {
             let (writer, reader) = self
                 .device
@@ -384,16 +439,19 @@ fn configure_linux_tun_offload(device: &AsyncDevice, enable_gso: bool) -> TunOff
     TunOffloadStatus::enabled()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 struct DarwinTunHalves {
     reader: DarwinTunReader,
     writer: DarwinTunWriter,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 impl DarwinTunHalves {
-    fn new(device: &AsyncDevice) -> VpnResult<Self> {
-        let fd = duplicate_fd(device.as_raw_fd())?;
+    /// Build async read/write halves from a `utun` raw fd. The fd is `dup`ed so
+    /// the halves own their copy independently of the caller (macOS passes the
+    /// `tun`-crate device's fd; iOS passes the Network Extension's fd).
+    fn from_raw_fd(fd: RawFd) -> VpnResult<Self> {
+        let fd = duplicate_fd(fd)?;
         let fd = Arc::new(
             AsyncFd::new(fd)
                 .map_err(|e| VpnError::tun_device_with_source("Failed to register utun fd", e))?,
@@ -405,7 +463,7 @@ impl DarwinTunHalves {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn duplicate_fd(fd: RawFd) -> VpnResult<OwnedFd> {
     let duplicated = unsafe { libc::dup(fd) };
     if duplicated < 0 {
@@ -417,12 +475,12 @@ fn duplicate_fd(fd: RawFd) -> VpnResult<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 struct DarwinTunReader {
     fd: Arc<AsyncFd<OwnedFd>>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 impl DarwinTunReader {
     async fn read_buf(&mut self, buf: &mut ReadBuf<'_>) -> VpnResult<()> {
         self.fd
@@ -434,7 +492,7 @@ impl DarwinTunReader {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn read_utun_frame_into(fd: RawFd, buf: &mut ReadBuf<'_>) -> io::Result<()> {
     if buf.remaining() == 0 {
         return Err(io::Error::new(
@@ -463,12 +521,12 @@ fn read_utun_frame_into(fd: RawFd, buf: &mut ReadBuf<'_>) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 struct DarwinTunWriter {
     fd: Arc<AsyncFd<OwnedFd>>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 impl DarwinTunWriter {
     async fn write_packet(&mut self, ip_packet: &[u8]) -> VpnResult<()> {
         let header = darwin_packet_information(ip_packet)?;
@@ -481,7 +539,7 @@ impl DarwinTunWriter {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn darwin_packet_information(ip_packet: &[u8]) -> VpnResult<[u8; tun::PACKET_INFORMATION_LENGTH]> {
     let Some(first_byte) = ip_packet.first() else {
         return Err(VpnError::tun_device(
@@ -501,7 +559,7 @@ fn darwin_packet_information(ip_packet: &[u8]) -> VpnResult<[u8; tun::PACKET_INF
     Ok((family as u32).to_be_bytes())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn write_utun_frame_vectored(
     fd: RawFd,
     header: &[u8; tun::PACKET_INFORMATION_LENGTH],
@@ -540,16 +598,16 @@ fn write_utun_frame_vectored(
 }
 
 enum TunReaderInner {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     Standard(DeviceReader),
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     Darwin(DarwinTunReader),
 }
 
 enum TunWriterInner {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     Standard(DeviceWriter),
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     Darwin(DarwinTunWriter),
 }
 
@@ -603,13 +661,13 @@ impl TunReader {
     /// Tokio's safe `ReadBuf` abstraction.
     pub async fn read_buf(&mut self, buf: &mut ReadBuf<'_>) -> VpnResult<()> {
         match &mut self.inner {
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(target_vendor = "apple"))]
             TunReaderInner::Standard(reader) => {
                 poll_fn(|cx| Pin::new(&mut *reader).poll_read(cx, buf))
                     .await
                     .map_err(VpnError::Network)
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             TunReaderInner::Darwin(reader) => reader.read_buf(buf).await,
         }
     }
@@ -648,7 +706,7 @@ impl TunWriter {
         offload: Option<&crate::tunnel::offload::VirtioNetHdr>,
         ip_packet: &[u8],
     ) -> VpnResult<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         {
             let TunWriterInner::Darwin(writer) = &mut self.inner;
             if offload.is_some() {
@@ -659,7 +717,7 @@ impl TunWriter {
             return writer.write_packet(ip_packet).await;
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         {
             if !self.vnet_hdr_enabled {
                 // No header to prepend: write the packet directly, skipping the
@@ -733,14 +791,14 @@ impl TunWriter {
             }
             match assemble_tcp_gso_superframe(&mut self.scratch, &batch[start..end]) {
                 Ok(()) => match &mut self.inner {
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(target_vendor = "apple"))]
                     TunWriterInner::Standard(writer) => {
                         writer
                             .write_all(&self.scratch)
                             .await
                             .map_err(VpnError::Network)?;
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(target_vendor = "apple")]
                     TunWriterInner::Darwin(_) => unreachable!("handled by Darwin fast path"),
                 },
                 Err(e) => {
@@ -1010,7 +1068,7 @@ impl Route for Ipv6Net {
 /// guard drops would tear down routing state this process never created (e.g. a
 /// default route or a bypass route the user already had).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RouteAddOutcome {
+pub enum RouteAddOutcome {
     /// The route was added by this process; the caller owns its cleanup.
     Added,
     /// The route already existed; ownership stays with whoever created it.

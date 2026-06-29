@@ -5,7 +5,15 @@
 //! IP-over-QUIC tunnel. IP packets are framed and sent directly over the
 //! encrypted iroh QUIC connection for automatic NAT traversal.
 
+// On iOS only the portable data plane (run_tunnel + the handshake) is used;
+// VpnClient, routing, the bypass manager and the reconnect wrapper are all
+// desktop-only (they need the gated-out control/runtime modules) and compile
+// here as dead code. Silence the resulting unused-import / dead-code noise on
+// iOS rather than finely gating every line.
+#![cfg_attr(target_os = "ios", allow(unused_imports, dead_code))]
+
 use crate::net::buffer::uninitialized_vec;
+#[cfg(not(target_os = "ios"))]
 use crate::config::VpnClientConfig;
 use crate::tunnel::datagram::{
     Datagram, FRAME_ARENA_CHUNK, build_datagrams, build_gro_datagrams, classify,
@@ -14,8 +22,10 @@ use crate::net::device::{
     BypassRouteGuard, Route6Guard, RouteGuard, TunConfig, TunDevice, UnderlayGateway,
     add_bypass_route, add_routes, add_routes6_with_src, query_default_gateway,
 };
+#[cfg(not(target_os = "ios"))]
 use crate::control::{ClientConnectedInfo, ClientStatusHandle};
 use crate::error::{VpnError, VpnResult};
+#[cfg(not(target_os = "ios"))]
 use crate::runtime::{LockRole, VpnLock};
 use crate::tunnel::offload::{TcpGroTable, VirtioNetHdr, materialize_offload_into};
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
@@ -85,6 +95,11 @@ async fn enqueue_inbound_tun_write(tx: &mpsc::Sender<InboundTunWrite>, req: Inbo
 }
 
 /// VPN client instance.
+///
+/// Desktop-only: holds the single-instance lock and the control-socket status
+/// handle. On iOS the connect path lives in [`crate::tunnel::ios`] and drives an
+/// OS-provided utun fd instead.
+#[cfg(not(target_os = "ios"))]
 pub struct VpnClient {
     /// Client configuration.
     config: VpnClientConfig,
@@ -248,6 +263,7 @@ fn check_params_against(
     )))
 }
 
+#[cfg(not(target_os = "ios"))]
 impl VpnClient {
     /// Create a new VPN client.
     ///
@@ -627,89 +643,7 @@ impl VpnClient {
         &self,
         connection: &iroh::endpoint::Connection,
     ) -> VpnResult<ServerInfo> {
-        // Open bidirectional stream for handshake
-        let (mut send, mut recv) = connection
-            .open_bi()
-            .await
-            .map_err(|e| VpnError::Signaling(format!("Failed to open stream: {}", e)))?;
-
-        // Send handshake. The client advertises its data-channel GSO capability
-        // here (the data path is datagrams, so there is no separate, racy
-        // capabilities message — the reliable handshake carries it).
-        let mut handshake = VpnHandshake::new(self.device_id).with_gso(ADVERTISED_GSO);
-        if let Some(ref token) = self.config.auth_token {
-            handshake = handshake.with_auth_token(token);
-        }
-
-        write_message(&mut send, &handshake.encode()?).await?;
-
-        // Read response
-        let response_data = read_message(&mut recv, MAX_HANDSHAKE_SIZE).await?;
-        let response = VpnHandshakeResponse::decode(&response_data)?;
-
-        if !response.accepted {
-            let reason = response
-                .reject_reason
-                .unwrap_or_else(|| "Unknown".to_string());
-            return Err(VpnError::AuthenticationFailed(reason));
-        }
-
-        // Extract IPv4 info (optional, for IPv4-only or dual-stack)
-        // All three IPv4 fields must be present together or all absent for consistency
-        let (assigned_ip, network, server_ip) =
-            match (response.assigned_ip, response.network, response.server_ip) {
-                (Some(ip), Some(net), Some(gw)) => (Some(ip), Some(net), Some(gw)),
-                (None, None, None) => (None, None, None),
-                _ => {
-                    return Err(VpnError::Signaling(
-                        "Server response has incomplete IPv4 configuration: \
-                     assigned_ip, network, and server_ip must all be present or all absent"
-                            .into(),
-                    ));
-                }
-            };
-
-        // Extract IPv6 info (optional, for IPv6-only or dual-stack)
-        // All three IPv6 fields must be present together or all absent for consistency
-        let (assigned_ip6, network6, server_ip6) = match (
-            response.assigned_ip6,
-            response.network6,
-            response.server_ip6,
-        ) {
-            (Some(ip), Some(net), Some(gw)) => (Some(ip), Some(net), Some(gw)),
-            (None, None, None) => (None, None, None),
-            _ => {
-                return Err(VpnError::Signaling(
-                    "Server response has incomplete IPv6 configuration: \
-                     assigned_ip6, network6, and server_ip6 must all be present or all absent"
-                        .into(),
-                ));
-            }
-        };
-
-        // At least one of IPv4 or IPv6 must be provided
-        if assigned_ip.is_none() && assigned_ip6.is_none() {
-            return Err(VpnError::Signaling(
-                "Server response missing both IPv4 and IPv6 configuration".into(),
-            ));
-        }
-
-        // Close handshake stream (best-effort, handshake already completed)
-        if let Err(e) = send.finish() {
-            log::debug!("Failed to finish handshake stream: {}", e);
-        }
-        Ok(ServerInfo {
-            assigned_ip,
-            network,
-            server_ip,
-            assigned_ip6,
-            network6,
-            server_ip6,
-            server_gso_enabled: response.server_gso_enabled,
-            transport: response.transport,
-            mtu: response.mtu,
-            server_addrs: response.server_addrs,
-        })
+        perform_handshake(connection, self.device_id, self.config.auth_token.as_deref()).await
     }
 
     /// Create and configure the TUN device.
@@ -843,6 +777,101 @@ impl VpnClient {
             collected,
         }
     }
+}
+
+/// Perform the VPN handshake on `connection` and return the server-assigned
+/// network parameters.
+///
+/// Shared by the desktop [`VpnClient`] and the iOS connect path
+/// ([`crate::tunnel::ios`]): both open a bi-stream, send a [`VpnHandshake`]
+/// (advertising data-channel GSO), and parse the [`VpnHandshakeResponse`]. The
+/// `device_id` keys the server's idempotent IP allocation; `auth_token` is the
+/// optional pre-shared credential.
+pub(crate) async fn perform_handshake(
+    connection: &Connection,
+    device_id: u64,
+    auth_token: Option<&str>,
+) -> VpnResult<ServerInfo> {
+    // Open bidirectional stream for handshake
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| VpnError::Signaling(format!("Failed to open stream: {}", e)))?;
+
+    // Send handshake. The client advertises its data-channel GSO capability
+    // here (the data path is datagrams, so there is no separate, racy
+    // capabilities message — the reliable handshake carries it).
+    let mut handshake = VpnHandshake::new(device_id).with_gso(ADVERTISED_GSO);
+    if let Some(token) = auth_token {
+        handshake = handshake.with_auth_token(token);
+    }
+
+    write_message(&mut send, &handshake.encode()?).await?;
+
+    // Read response
+    let response_data = read_message(&mut recv, MAX_HANDSHAKE_SIZE).await?;
+    let response = VpnHandshakeResponse::decode(&response_data)?;
+
+    if !response.accepted {
+        let reason = response
+            .reject_reason
+            .unwrap_or_else(|| "Unknown".to_string());
+        return Err(VpnError::AuthenticationFailed(reason));
+    }
+
+    // Extract IPv4 info (optional, for IPv4-only or dual-stack)
+    // All three IPv4 fields must be present together or all absent for consistency
+    let (assigned_ip, network, server_ip) =
+        match (response.assigned_ip, response.network, response.server_ip) {
+            (Some(ip), Some(net), Some(gw)) => (Some(ip), Some(net), Some(gw)),
+            (None, None, None) => (None, None, None),
+            _ => {
+                return Err(VpnError::Signaling(
+                    "Server response has incomplete IPv4 configuration: \
+                     assigned_ip, network, and server_ip must all be present or all absent"
+                        .into(),
+                ));
+            }
+        };
+
+    // Extract IPv6 info (optional, for IPv6-only or dual-stack)
+    // All three IPv6 fields must be present together or all absent for consistency
+    let (assigned_ip6, network6, server_ip6) =
+        match (response.assigned_ip6, response.network6, response.server_ip6) {
+            (Some(ip), Some(net), Some(gw)) => (Some(ip), Some(net), Some(gw)),
+            (None, None, None) => (None, None, None),
+            _ => {
+                return Err(VpnError::Signaling(
+                    "Server response has incomplete IPv6 configuration: \
+                     assigned_ip6, network6, and server_ip6 must all be present or all absent"
+                        .into(),
+                ));
+            }
+        };
+
+    // At least one of IPv4 or IPv6 must be provided
+    if assigned_ip.is_none() && assigned_ip6.is_none() {
+        return Err(VpnError::Signaling(
+            "Server response missing both IPv4 and IPv6 configuration".into(),
+        ));
+    }
+
+    // Close handshake stream (best-effort, handshake already completed)
+    if let Err(e) = send.finish() {
+        log::debug!("Failed to finish handshake stream: {}", e);
+    }
+    Ok(ServerInfo {
+        assigned_ip,
+        network,
+        server_ip,
+        assigned_ip6,
+        network6,
+        server_ip6,
+        server_gso_enabled: response.server_gso_enabled,
+        transport: response.transport,
+        mtu: response.mtu,
+        server_addrs: response.server_addrs,
+    })
 }
 
 /// Send every queued datagram over the connection.
@@ -1298,6 +1327,7 @@ pub(crate) async fn run_tunnel(
     Err(VpnError::ConnectionLost(reason))
 }
 
+#[cfg(not(target_os = "ios"))]
 impl VpnClient {
     /// Connect to the VPN server with automatic reconnection on failure.
     ///
@@ -1754,8 +1784,38 @@ fn calculate_backoff_with_rng(attempt: u32, rng: &mut impl Rng) -> Duration {
 }
 
 /// Collect local UDP ports bound by the iroh endpoint.
-fn collect_local_iroh_udp_ports(endpoint: &Endpoint) -> HashSet<u16> {
+pub(crate) fn collect_local_iroh_udp_ports(endpoint: &Endpoint) -> HashSet<u16> {
     endpoint.addr().ip_addrs().map(|addr| addr.port()).collect()
+}
+
+/// Server underlay addresses in `server_addrs` that fall within a routed prefix,
+/// as host CIDRs. In a split tunnel these would self-capture (the tunnel would
+/// route iroh's own transport packets to the server back into itself); on iOS
+/// they are applied as `excludedRoutes` so the OS keeps them on the underlay.
+///
+/// Returns `(IPv4 /32 strings, IPv6 /128 strings)`. Uses the same
+/// `ipnet::contains` membership test as the desktop `BypassRouteManager`. The
+/// relay set is deliberately ignored: full tunnel is out of scope on iOS, so a
+/// public relay address never overlaps the private routed prefixes.
+///
+/// Only the iOS connect path consumes this (desktop uses `BypassRouteManager`),
+/// so it is dead code on non-iOS builds outside the unit tests.
+#[cfg_attr(not(any(target_os = "ios", test)), allow(dead_code))]
+pub(crate) fn overlapping_underlay_excludes(
+    server_addrs: &[IpAddr],
+    routes4: &[Ipv4Net],
+    routes6: &[Ipv6Net],
+) -> (Vec<String>, Vec<String>) {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for ip in server_addrs {
+        match ip {
+            IpAddr::V4(a) if routes4.iter().any(|n| n.contains(a)) => v4.push(format!("{a}/32")),
+            IpAddr::V6(a) if routes6.iter().any(|n| n.contains(a)) => v6.push(format!("{a}/128")),
+            _ => {}
+        }
+    }
+    (v4, v6)
 }
 
 /// Return true if packet is UDP and either source/destination port matches a blocked port.
@@ -1815,6 +1875,45 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+
+    #[test]
+    fn overlapping_excludes_keeps_only_routed_underlay_addresses() {
+        let server_addrs: Vec<IpAddr> = [
+            "192.168.1.5",        // private v4, inside routed prefix -> excluded
+            "44.230.20.120",      // public v4, outside routes      -> dropped
+            "fd12::5",            // ULA v6, inside routed prefix    -> excluded
+            "2606:4700::1",       // public v6, outside routes       -> dropped
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let routes4: Vec<Ipv4Net> = vec!["192.168.0.0/16".parse().unwrap()];
+        let routes6: Vec<Ipv6Net> = vec!["fd12::/16".parse().unwrap()];
+
+        let (v4, v6) = overlapping_underlay_excludes(&server_addrs, &routes4, &routes6);
+        assert_eq!(v4, vec!["192.168.1.5/32".to_string()]);
+        assert_eq!(v6, vec!["fd12::5/128".to_string()]);
+    }
+
+    #[test]
+    fn overlapping_excludes_empty_when_no_routes_or_no_overlap() {
+        let server_addrs: Vec<IpAddr> =
+            ["192.168.1.5", "fd12::5"].iter().map(|s| s.parse().unwrap()).collect();
+
+        // No routes at all.
+        assert_eq!(
+            overlapping_underlay_excludes(&server_addrs, &[], &[]),
+            (Vec::new(), Vec::new())
+        );
+
+        // Routes that don't contain the server addresses.
+        let routes4: Vec<Ipv4Net> = vec!["10.0.0.0/8".parse().unwrap()];
+        let routes6: Vec<Ipv6Net> = vec!["fd99::/16".parse().unwrap()];
+        assert_eq!(
+            overlapping_underlay_excludes(&server_addrs, &routes4, &routes6),
+            (Vec::new(), Vec::new())
+        );
+    }
 
     fn bypass_manager(routes4: &[&str], routes6: &[&str]) -> BypassRouteManager {
         BypassRouteManager::new(

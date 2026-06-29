@@ -581,6 +581,16 @@ For unattended clients under systemd, launchd, or a Windows service, see
 That guide also covers the fixed runtime directory used by `status`, `list`,
 and Unix `stop` under service managers.
 
+## iOS App (Proof of Concept)
+
+`ezvpn` runs on iOS as a Network Extension, as a proof of concept (dual-stack
+split tunnel, real-device testing; no full tunnel, no App Store packaging). The
+Rust core builds into a static library here; the Swift app lives in a separate
+repo, [`ezvpn-ios`](https://github.com/andrewtheguy/ezvpn-ios).
+
+See [`docs/IOS-POC.md`](docs/IOS-POC.md) for scope, how it reuses the core, the C
+interface, and build steps.
+
 ## Architecture
 
 Detailed internals, flow diagrams, client isolation rules, and reconnect

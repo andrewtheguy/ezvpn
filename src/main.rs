@@ -4,17 +4,12 @@
 //! Uses ezvpn auth tokens for access control and TLS 1.3/QUIC for encryption.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-compile_error!("ezvpn only supports Linux, macOS, and Windows");
+compile_error!("the ezvpn CLI only supports Linux, macOS, and Windows");
 
-mod auth;
-mod config;
-mod control;
-mod error;
-mod net;
-mod runtime;
-mod secret;
-mod transport;
-mod tunnel;
+// The desktop CLI consumes the `ezvpn` library crate (see src/lib.rs). Bring the
+// modules it references by bare path into scope so the existing `auth::`,
+// `runtime::`, `control::`, `secret::` call sites keep resolving unchanged.
+use ezvpn::{auth, control, runtime, secret};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -23,17 +18,17 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
-use crate::config::file_config::{
+use ezvpn::config::file_config::{
     ResolvedVpnClientConfig, ResolvedVpnServerConfig, VpnClientConfig as TomlClientConfig,
     VpnClientConfigBuilder, VpnServerConfig as TomlServerConfig, expand_tilde,
     load_vpn_client_config, load_vpn_server_config,
 };
-use crate::runtime::LockRole;
-use crate::transport::endpoint::{create_client_endpoint, create_server_endpoint, load_secret};
+use ezvpn::runtime::LockRole;
+use ezvpn::transport::endpoint::{create_client_endpoint, create_server_endpoint, load_secret};
 // Runtime config types (different from the TOML config types in config::file_config)
-use crate::config::{VpnClientConfig, VpnServerConfig};
-use crate::tunnel::signaling::build_vpn_alpn;
-use crate::tunnel::{VpnClient, VpnServer};
+use ezvpn::config::{VpnClientConfig, VpnServerConfig};
+use ezvpn::tunnel::signaling::build_vpn_alpn;
+use ezvpn::tunnel::{VpnClient, VpnServer};
 
 #[derive(Parser)]
 #[command(name = "ezvpn")]

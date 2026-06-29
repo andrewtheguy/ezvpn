@@ -98,7 +98,7 @@ fn platform_runtime_dir() -> PathBuf {
 /// on Windows. Override with the `EZVPN_LOG_DIR` environment variable; it must
 /// be an absolute path (validated at startup by [`validate_dir_env`]).
 #[cfg(not(test))]
-pub(crate) fn log_dir() -> PathBuf {
+pub fn log_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("EZVPN_LOG_DIR")
         && !dir.is_empty()
     {
@@ -110,7 +110,7 @@ pub(crate) fn log_dir() -> PathBuf {
 /// Test build: reuse the isolated per-process temp dir so the suite neither
 /// touches a real `/var/log` nor needs root.
 #[cfg(test)]
-pub(crate) fn log_dir() -> PathBuf {
+pub fn log_dir() -> PathBuf {
     runtime_dir()
 }
 
@@ -207,7 +207,7 @@ fn check_absolute_dir(var: &str, val: Option<&OsStr>) -> VpnResult<()> {
 
 /// Validate the directory-override environment variables at startup, before any
 /// Tokio runtime or daemonization. Each, if set, must be an absolute path.
-pub(crate) fn validate_dir_env() -> VpnResult<()> {
+pub fn validate_dir_env() -> VpnResult<()> {
     for var in DIR_ENV_VARS {
         check_absolute_dir(var, std::env::var_os(var).as_deref())?;
     }
@@ -247,7 +247,7 @@ pub(crate) fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
 /// Only the Unix daemonization path creates the log dir up front, so this is
 /// Unix-only; elsewhere `log_dir` is resolved without pre-creating it.
 #[cfg(unix)]
-pub(crate) fn ensure_log_dir() -> std::io::Result<PathBuf> {
+pub fn ensure_log_dir() -> std::io::Result<PathBuf> {
     ensure_dir(log_dir())
 }
 
@@ -285,7 +285,7 @@ const MAX_INSTANCE_NAME_LEN: usize = 64;
 /// `ezvpn-client-default`. Both the instance lock and the status control
 /// socket derive their paths from this so they stay consistent for a given
 /// (role, instance) within a single user.
-pub(crate) fn runtime_base_name(role: LockRole, instance: &str) -> String {
+pub fn runtime_base_name(role: LockRole, instance: &str) -> String {
     format!("ezvpn-{}-{}", role.slug(), instance)
 }
 
@@ -430,7 +430,7 @@ impl VpnLock {
 /// `client stop` signals via `SIGTERM`, which only exists on Unix, so this
 /// PID-reading helper is Unix-only.
 #[cfg(unix)]
-pub(crate) fn read_instance_pid(role: LockRole, instance: &str) -> std::io::Result<Option<u32>> {
+pub fn read_instance_pid(role: LockRole, instance: &str) -> std::io::Result<Option<u32>> {
     // Re-validate (like `acquire`) so a separator/traversal name cannot reach
     // `lock_path` through this pub(crate) helper, even if a caller skips the
     // earlier CLI validation.

@@ -1,10 +1,16 @@
 [package]
 name = "ezvpn"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
 repository = "https://github.com/andrewtheguy/ezvpn"
+
+[lib]
+name = "ezvpn"
+# rlib: consumed by the desktop bin (src/main.rs) and tests.
+# staticlib: linked into the iOS Network Extension (aarch64-apple-ios).
+crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 anyhow = "1"
