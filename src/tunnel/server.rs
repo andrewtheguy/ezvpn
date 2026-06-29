@@ -2258,8 +2258,9 @@ fn ip_in_overlay(ip: IpAddr, overlay_v4: Option<Ipv4Net>, overlay_v6: Option<Ipv
 ///
 /// Returns `Err(())` only when the client's writer receiver is gone (the
 /// connection is being torn down), which tells the caller to stop publishing.
-/// An empty address set or an encode error is a no-op (`Ok`): the next tick
-/// retries.
+/// An empty address set, an encode error, or a full packet queue is a no-op
+/// (`Ok`): the enqueue is non-blocking, so address publication never waits on
+/// client data backpressure and the next tick retries.
 async fn publish_server_addrs(
     endpoint: &Endpoint,
     packet_tx: &mpsc::Sender<Bytes>,
@@ -2280,7 +2281,10 @@ async fn publish_server_addrs(
         return Ok(());
     }
 
-    match packet_tx.send(buf.freeze()).await {
+    // Non-blocking: address publication is best-effort and must never wait for
+    // queue space behind client data backpressure. A full queue skips this tick
+    // (the next one retries); only a dropped receiver is terminal.
+    match packet_tx.try_send(buf.freeze()) {
         Ok(()) => {
             log::trace!(
                 "Published {} candidate server underlay addrs to {}",
@@ -2289,8 +2293,10 @@ async fn publish_server_addrs(
             );
             Ok(())
         }
+        // Queue full: skip this tick, the next one retries.
+        Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
         // Writer's receiver dropped: the connection is gone, stop publishing.
-        Err(_) => Err(()),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
     }
 }
 
