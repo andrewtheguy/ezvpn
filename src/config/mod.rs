@@ -1,5 +1,9 @@
 //! VPN configuration types.
 
+// `file_config` also defines core transport/MTU types used by the data plane
+// (`TransportTuning`, `CongestionController`, `DEFAULT_VPN_MTU`), so it stays
+// available on iOS. Only the on-disk TOML loading inside it (which needs
+// `crate::runtime::config_dir`) is gated off iOS.
 pub mod file_config;
 
 use ipnet::{Ipv4Net, Ipv6Net};
