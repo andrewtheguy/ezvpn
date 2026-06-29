@@ -375,6 +375,20 @@ host route for that single address so the QUIC tunnel's own underlay packets are
 not fed back into the tunnel (which would deadlock the connection). The bypass is
 installed for the lifetime of the session and is **not** removed mid-session.
 
+**This is the same principle as any traditional VPN** — it just has less
+visibility here. A conventional client (OpenVPN, WireGuard, IPsec) must also keep
+packets to the VPN *gateway's own address* off the tunnel; otherwise the
+encrypted transport gets routed into the very tunnel it carries and the link
+deadlocks. There it's obvious and singular: you type in one endpoint IP, and the
+client pins exactly one host route to it via the physical gateway. `ezvpn` does
+the identical thing, but the transport endpoint is **not** a single static IP you
+configured — iroh discovers it at runtime and may use several of the server's
+addresses (IPv4 *and* IPv6) and fall back to public **relay servers**. So instead
+of one hand-configured bypass you can see, `ezvpn` pins a *set* of addresses: the
+server's dynamically-discovered direct addresses, together with the resolved IPs
+of its preconfigured list of relays. That larger, runtime-determined set is
+exactly why the effect is easy to miss and worth spelling out below.
+
 This affects **only that one transport address — not the rest of the prefix.**
 Other hosts inside the same routed CIDR still route through the VPN normally; only
 the address iroh is actively using as its underlay endpoint is pinned. (In a full
@@ -387,10 +401,21 @@ not through the VPN**, for as long as the client is connected. If that same host
 also serves resources you want to reach *through* the tunnel, do not address them
 by that public IP — it will skip the VPN.
 
-Instead, **access in-VPN resources by their VPN-internal address** (the
-server/peer's address inside the VPN subnet, e.g. `10.99.0.1` /
-`fd11:9a0b:1095:99::1`). Reserving the public address purely for tunnel transport
-and using VPN IPs for actual traffic avoids the ambiguity entirely.
+**The surprising case is the VPN server itself.** The pinned address is the
+server's *own* transport endpoint, so you get an asymmetry that looks like a bug
+but isn't: a given public address (e.g. an egress-only IPv6) on **any other
+host** is reachable through the tunnel as normal, yet the **same kind of address
+on the VPN server** is the one pinned off the tunnel and reachable only over the
+underlay. "I can hit this egress-only IPv6 on host X through the VPN, but not the
+identical-looking one on the VPN server" is therefore expected — the only
+difference is that the server's address doubles as the tunnel's underlay
+endpoint, so it must stay off the tunnel.
+
+Instead, **access the VPN server (and any in-VPN resource) by its VPN-internal
+address** (the server/peer's address inside the VPN subnet, e.g. `10.99.0.1` /
+`fd11:9a0b:1095:99::1`), not its public IP. Reserving the public address purely
+for tunnel transport and using VPN IPs for actual traffic avoids the ambiguity
+entirely.
 
 > Earlier versions tried to *remove* the bypass route whenever iroh dropped that
 > peer from its path set, in an attempt to restore direct access to the public

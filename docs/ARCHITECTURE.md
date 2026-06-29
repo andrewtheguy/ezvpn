@@ -334,8 +334,15 @@ transport is reachable only over the underlay, not through the VPN, while the
 client is connected. If that same host also exposes resources meant to be reached
 *through* the tunnel, those must be addressed by their **VPN-internal IP** (the
 in-subnet server/peer address, e.g. `10.x` / `fd11:…`) — not by the public
-address that doubles as the tunnel underlay endpoint. This is documented for end
-users in the README "Routing" section.
+address that doubles as the tunnel underlay endpoint.
+
+The most confusing instance is the **VPN server itself**: because the pinned
+address is the server's *own* transport endpoint, an identical-looking public
+address (e.g. an egress-only IPv6) is reachable through the tunnel on *any other*
+host but **not** on the VPN server, where it is pinned to the underlay. This
+asymmetry reads as a bug but is expected — the server's address doubles as the
+tunnel underlay endpoint, so reach the server by its VPN-internal subnet IP
+instead. This is documented for end users in the README "Routing" section.
 
 ### Security Model
 
