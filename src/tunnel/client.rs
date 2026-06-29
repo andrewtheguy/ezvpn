@@ -30,10 +30,10 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::endpoint::{ConnectOptions, Connection, SendDatagramError};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rand::Rng;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
@@ -439,24 +439,26 @@ impl VpnClient {
         // installation below can early-return via `?` before `run_tunnel` takes
         // ownership, and a dropped bare handle would leak the task rather than
         // abort it. The guard is disarmed only when ownership passes onward.
-        let (bypass_route_guard, server_addr_tx): (
-            Option<AbortOnDropTask>,
-            Option<mpsc::Sender<HashSet<IpAddr>>>,
-        ) = if will_add_routes {
-            let handles = self
-                .add_iroh_bypass_routes(
+        let bypass_handles = if will_add_routes {
+            Some(
+                self.add_iroh_bypass_routes(
                     endpoint,
                     tun_device.name(),
                     relay_urls,
                     &server_info.server_addrs,
                 )
-                .await;
-            (
-                Some(AbortOnDropTask::new(handles.task)),
-                Some(handles.server_addr_tx),
+                .await,
             )
         } else {
-            (None, None)
+            None
+        };
+        let (bypass_route_guard, server_addr_tx, bypass_collected) = match bypass_handles {
+            Some(h) => (
+                Some(AbortOnDropTask::new(h.task)),
+                Some(h.server_addr_tx),
+                Some(h.collected),
+            ),
+            None => (None, None, None),
         };
 
         // Add custom IPv4 routes through the VPN (guard ensures cleanup on drop)
@@ -529,8 +531,17 @@ impl VpnClient {
 
         // Publish connected status for the control socket. The probe captures a
         // clone of the connection so `status` reports live iroh path info
-        // (direct/relay).
+        // (direct/relay). A second probe reports the bypass addresses the manager
+        // has collected (intended bypasses), when a manager is running.
         let status_conn = connection.clone();
+        let bypass_probe: Option<crate::control::BypassRoutesProbe> =
+            bypass_collected.map(|collected| {
+                let probe: crate::control::BypassRoutesProbe = Arc::new(move || {
+                    let set = collected.lock().expect("collected lock poisoned");
+                    set.iter().map(|ip| ip.to_string()).collect()
+                });
+                probe
+            });
         self.status.set_connected(
             ClientConnectedInfo {
                 assigned_ip: server_info.assigned_ip.map(|ip| ip.to_string()),
@@ -545,6 +556,7 @@ impl VpnClient {
                 routes6: active_routes6,
             },
             Arc::new(move || format_connection_paths(&status_conn.paths())),
+            bypass_probe,
         );
 
         // Drop any tunneled UDP packets that target this endpoint's own iroh
@@ -784,6 +796,9 @@ impl VpnClient {
             capture_underlay_gateway(true).await
         };
 
+        // Shared set of intended bypasses, surfaced in client status; the manager
+        // writes it, the status probe reads it.
+        let collected = Arc::new(Mutex::new(BTreeSet::new()));
         let mut manager = BypassRouteManager::new(
             vpn_tun_name.to_string(),
             HashMap::new(),
@@ -791,6 +806,7 @@ impl VpnClient {
             vpn_routes6,
             underlay_gw4,
             underlay_gw6,
+            collected.clone(),
         );
 
         // Eagerly bypass the bootstrap set before the caller installs VPN routes:
@@ -823,6 +839,7 @@ impl VpnClient {
         BypassRouteHandles {
             task: handle,
             server_addr_tx,
+            collected,
         }
     }
 }
@@ -1390,6 +1407,11 @@ struct BypassRouteManager {
     underlay_gw4: Option<UnderlayGateway>,
     /// IPv6 underlay default gateway (same role as `underlay_gw4`).
     underlay_gw6: Option<UnderlayGateway>,
+    /// All VPN-covered addresses this manager has been asked to bypass this
+    /// session (intended bypasses), shared with the status handle for debugging.
+    /// Add-only and superset of the applied `active_routes`: an entry here may
+    /// have failed to install as an OS route, so it is *collected*, not *applied*.
+    collected: Arc<Mutex<BTreeSet<IpAddr>>>,
 }
 
 impl BypassRouteManager {
@@ -1400,6 +1422,7 @@ impl BypassRouteManager {
         vpn_routes6: Vec<Ipv6Net>,
         underlay_gw4: Option<UnderlayGateway>,
         underlay_gw6: Option<UnderlayGateway>,
+        collected: Arc<Mutex<BTreeSet<IpAddr>>>,
     ) -> Self {
         Self {
             active_routes,
@@ -1408,6 +1431,7 @@ impl BypassRouteManager {
             vpn_routes6,
             underlay_gw4,
             underlay_gw6,
+            collected,
         }
     }
 
@@ -1453,6 +1477,14 @@ impl BypassRouteManager {
                 needed
             })
             .collect();
+
+        // Record the intended (VPN-covered) bypasses for status/debugging, before
+        // attempting to install them — so an address that fails to apply still
+        // shows up as collected. Add-only, mirroring `active_routes`.
+        if !required_ips.is_empty() {
+            let mut collected = self.collected.lock().expect("collected lock poisoned");
+            collected.extend(required_ips.iter().copied());
+        }
 
         let to_add: Vec<IpAddr> = required_ips
             .iter()
@@ -1530,6 +1562,9 @@ async fn capture_underlay_gateway(is_ipv6: bool) -> Option<UnderlayGateway> {
 struct BypassRouteHandles {
     task: JoinHandle<()>,
     server_addr_tx: mpsc::Sender<HashSet<IpAddr>>,
+    /// Shared set of VPN-covered addresses the manager has collected (intended
+    /// bypasses), surfaced in client status. See `BypassRouteManager::collected`.
+    collected: Arc<Mutex<BTreeSet<IpAddr>>>,
 }
 
 /// Aborts the wrapped task on drop unless it is disarmed first.
@@ -1783,6 +1818,7 @@ mod tests {
             routes6.iter().map(|s| s.parse().unwrap()).collect(),
             None,
             None,
+            Arc::new(Mutex::new(BTreeSet::new())),
         )
     }
 

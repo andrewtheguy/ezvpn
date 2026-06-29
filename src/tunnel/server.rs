@@ -723,7 +723,12 @@ impl VpnServer {
     ///
     /// Reads only lock-free shared state (the clients map, atomic counters, and
     /// stats), so it is cheap to call from the control-socket listener.
-    fn status_snapshot(&self, node_id: String, uptime_secs: u64) -> StatusSnapshot {
+    fn status_snapshot(
+        &self,
+        node_id: String,
+        uptime_secs: u64,
+        bypass_addrs: Vec<String>,
+    ) -> StatusSnapshot {
         let mode = if self.config.network.is_none() {
             "ipv6"
         } else if self.config.network6.is_some() {
@@ -777,6 +782,7 @@ impl VpnServer {
             active_connections: self.active_connections.load(Ordering::Relaxed),
             clients,
             stats,
+            bypass_addrs,
         })
     }
 
@@ -897,9 +903,18 @@ impl VpnServer {
         let started_at = Instant::now();
         let node_id = endpoint.id().to_string();
         let status_server = server.clone();
+        let status_endpoint = endpoint.clone();
         let _status_listener =
             crate::control::spawn_status_listener(LockRole::Server, "default", move || {
-                status_server.status_snapshot(node_id.clone(), started_at.elapsed().as_secs())
+                let bypass_addrs = server_candidate_addrs(&status_endpoint)
+                    .iter()
+                    .map(|ip| ip.to_string())
+                    .collect();
+                status_server.status_snapshot(
+                    node_id.clone(),
+                    started_at.elapsed().as_secs(),
+                    bypass_addrs,
+                )
             });
         match &_status_listener {
             Ok(_) => log::info!("Status control socket ready (ezvpn server status)"),
@@ -1208,10 +1223,7 @@ impl VpnServer {
         // periodic data-path publication (`run_server_addr_publisher`). The client
         // filters to VPN-covered IPs and only ever adds, so publishing the full
         // set — including private/LAN addresses — is safe.
-        let mut server_addrs: Vec<IpAddr> = endpoint.addr().ip_addrs().map(|sa| sa.ip()).collect();
-        server_addrs.sort_unstable();
-        server_addrs.dedup();
-        let response = response.with_server_addrs(server_addrs);
+        let response = response.with_server_addrs(server_candidate_addrs(&endpoint));
 
         write_message(send, &response.encode()?).await?;
         if let Err(e) = send.finish() {
@@ -2179,6 +2191,16 @@ fn collect_local_iroh_udp_ports(endpoint: &Endpoint) -> HashSet<u16> {
     endpoint.addr().ip_addrs().map(|addr| addr.port()).collect()
 }
 
+/// The server's candidate iroh underlay addresses (deduped, sorted): the set it
+/// advertises to clients for bypass routing, in the handshake and over the data
+/// path. Shared by the handshake response, the periodic publisher, and `status`.
+fn server_candidate_addrs(endpoint: &Endpoint) -> Vec<IpAddr> {
+    let mut addrs: Vec<IpAddr> = endpoint.addr().ip_addrs().map(|sa| sa.ip()).collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
+
 /// Publish the server's current candidate underlay addresses to one client over
 /// the data-datagram path.
 ///
@@ -2191,13 +2213,11 @@ async fn publish_server_addrs(
     packet_tx: &mpsc::Sender<Bytes>,
     label: &str,
 ) -> Result<(), ()> {
-    let mut addrs: Vec<IpAddr> = endpoint.addr().ip_addrs().map(|sa| sa.ip()).collect();
+    let addrs = server_candidate_addrs(endpoint);
     if addrs.is_empty() {
         // No direct addresses discovered yet; nothing to bypass.
         return Ok(());
     }
-    addrs.sort_unstable();
-    addrs.dedup();
 
     let msg = ServerAddrsMsg::new(addrs);
     let mut buf = BytesMut::new();
