@@ -15,6 +15,25 @@ open inbound ports. Relay fallback is used when a direct path is unavailable.
 > Running `ezvpn` requires root/Administrator privileges to create TUN devices
 > and routes.
 
+## Project Scope
+
+The primary use case for `ezvpn` is easy access to private resources from home
+or another external network without opening inbound ports on the VPN server. A
+typical deployment is a small `ezvpn` server inside a private network, such as
+an AWS VPC, where clients need to reach private AWS resources or instances in
+private/egress-only subnets.
+
+`ezvpn` is not an anonymity network. If the default iroh relay/discovery
+infrastructure is used, iroh relay operators can observe connection metadata
+when relays are used for signaling or for carrying encrypted traffic. The VPN
+payload remains end-to-end encrypted over QUIC/TLS 1.3, so relay operators
+cannot decrypt the tunneled data.
+
+Full-tunnel routing (`0.0.0.0/0` and `::/0`) is supported, but it is still more
+experimental than routing explicit private prefixes. Full tunneling touches more
+of the host routing table and depends on bypass routes that keep the iroh
+underlay path to the server and relay infrastructure outside the VPN route.
+
 ## Features
 
 - Full subnet routing, not just single-port forwarding
@@ -31,6 +50,10 @@ open inbound ports. Relay fallback is used when a direct path is unavailable.
 
 Use `ezvpn` when you need:
 
+- Home or remote access to private cloud/VPC/LAN resources without opening
+  inbound firewall ports on the VPN server
+- Access to AWS resources that live behind private routes or in egress-only
+  subnets, using an `ezvpn` server inside that network as the gateway
 - Access to an entire remote subnet
 - Stable full-network routing between peers behind NAT
 - Cross-platform VPN connectivity on Linux, macOS, and Windows
@@ -50,6 +73,11 @@ another. Here every client only ever talks to the server gateway, so assigned
 IPs carry no such guarantee and the whole class of stale-IP and address-collision
 bookkeeping disappears. So do not use `ezvpn` for site-to-site routing between
 two LANs or for direct client-to-client traffic.
+
+Also do not use `ezvpn` when the goal is anonymity. iroh's relays can see relay
+metadata when they are involved, even though the VPN payload remains encrypted.
+For the most predictable routing behavior today, prefer split routes to the
+private resources you need over full-tunnel default routes.
 
 ## Installation
 
@@ -354,6 +382,11 @@ sudo ezvpn client start \
   --route 0.0.0.0/0 \
   --route6 ::/0
 ```
+
+Full tunnel mode is the experimental path. It is useful for testing and for
+controlled environments, but private-prefix split routing is the primary design
+target because it avoids many broad-route interactions with iroh server and relay
+bypass routes.
 
 Default routes are installed as split half-routes (`0.0.0.0/1` +
 `128.0.0.0/1`, and `::/1` + `8000::/1`) so the system default route is not

@@ -2,6 +2,20 @@
 
 `ezvpn` provides full-network tunneling using direct IP-over-QUIC. It creates a TUN device and routes IP traffic directly through encrypted iroh QUIC connections, eliminating double-encryption overhead while preserving TLS 1.3 security.
 
+The primary deployment model is remote access to private resources without
+opening inbound ports on the VPN server. In practice that usually means running
+an `ezvpn` server inside a private network, such as an AWS VPC, so a home or
+remote client can reach private AWS resources or hosts in private/egress-only
+subnets. Split routing to explicit private prefixes is the main design target.
+Full-tunnel default routing is supported, but remains more experimental because
+it interacts with broad host routes and the underlay bypass routes needed for
+iroh server and relay addresses.
+
+Anonymity is not a design goal. iroh's relay/discovery infrastructure can
+observe connection metadata when it is used for signaling or for carrying
+encrypted traffic. The tunneled payload is still end-to-end encrypted by
+QUIC/TLS 1.3, so relay operators cannot decrypt the VPN data.
+
 ## VPN Mode
 
 > **Note:** VPN mode requires root/admin privileges. On Windows, you also need `wintun.dll` from https://www.wintun.net/ (official WireGuard project) — download the zip, extract, and copy `wintun/bin/amd64/wintun.dll` to the same directory as the executable (or any directory in the system PATH).
@@ -410,6 +424,12 @@ address, so a direct path that overlaps a routed prefix would self-capture; run 
 server built with this feature to bypass direct server addresses in a full tunnel.
 
 ### Security Model
+
+The security model is private-resource access, not anonymity. Server identity,
+the ALPN knock token, auth tokens, and QUIC/TLS encryption protect the tunnel
+from unauthorized peers and keep VPN payloads confidential from iroh relays.
+Relays and discovery services may still see metadata such as participating
+endpoints, timing, volume, and relay use when they are involved.
 
 ```mermaid
 graph TB
