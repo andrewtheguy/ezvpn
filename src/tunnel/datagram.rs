@@ -14,7 +14,7 @@ use crate::error::{VpnError, VpnResult};
 use crate::tunnel::offload::{
     CoalescedOutput, VIRTIO_NET_HDR_LEN, VirtioNetHdr, materialize_offload_into,
 };
-use crate::tunnel::signaling::DataMessageType;
+use crate::tunnel::signaling::{DataMessageType, ServerAddrsMsg};
 use bytes::{BufMut, Bytes, BytesMut};
 
 /// Reserve granularity for the framing arena. Frames are appended to a
@@ -33,6 +33,9 @@ pub enum Datagram<'a> {
     /// IP packet message body (everything after the type byte): pass to
     /// [`crate::tunnel::signaling::parse_ip_packet_v2`].
     Ip(&'a [u8]),
+    /// Server-published candidate-address message body (everything after the
+    /// type byte): pass to [`ServerAddrsMsg::decode`]. Server → client only.
+    ServerAddrs(&'a [u8]),
 }
 
 /// Append an IP-packet datagram to `buf` (arena-style) and return the number of
@@ -116,17 +119,26 @@ pub fn build_datagrams(
             pending.push(frame_datagram(arena, Some(meta), packet)?);
         }
         Some(meta) => {
-            // Segment the super-frame so each emitted datagram fits.
-            materialize_offload_into(meta, packet, seg_scratch, |seg| {
-                // Segmentation is driven by `gso_size`, not the path cap, so a
-                // segment can still exceed `max_datagram_size` if `gso_size` is
-                // larger than the path allows. Drop and warn rather than emit an
-                // oversized datagram that would fail at send (mirrors the `None`
-                // arm); a dropped segment is recovered by inner-TCP retransmit.
+            // Segment the super-frame so each emitted datagram fits the path.
+            //
+            // The kernel sets `gso_size` to the *origin* flow's MSS — forwarded
+            // internet traffic, or a jumbo-MTU datacenter path (e.g. AWS) — which
+            // can exceed this connection's `max_datagram_size`. Re-segment at a
+            // size that fits rather than dropping oversized segments:
+            // `segment_tcp_gso_into` recomputes each segment's IP/TCP headers and
+            // checksums, so smaller TCP segments are fully valid and the peer's
+            // stack reassembles them transparently. Dropping instead would
+            // blackhole every large segment (the origin re-sends the same MSS, so
+            // inner-TCP retransmit does not recover) and stall throughput.
+            let seg_meta = clamp_gso_size_to_path(*meta, max_datagram_size);
+            materialize_offload_into(&seg_meta, packet, seg_scratch, |seg| {
+                // Safety net: only a pathologically small path (the IP/TCP header
+                // alone exceeds the datagram cap) can still overflow. Drop and
+                // warn rather than emit an oversized datagram that fails at send.
                 let framed_len = ip_datagram_len(false, seg.len());
                 if framed_len > max_datagram_size {
                     log::warn!(
-                        "Dropping GSO segment ({framed_len} B framed) exceeding max_datagram_size ({max_datagram_size}); gso_size too large for path"
+                        "Dropping GSO segment ({framed_len} B framed) exceeding max_datagram_size ({max_datagram_size}); header too large for path"
                     );
                     return Ok(());
                 }
@@ -153,6 +165,32 @@ pub fn build_datagrams(
         }
     }
     Ok(())
+}
+
+/// Reduce a TCP-GSO super-frame's `gso_size` so each resegmented packet, once
+/// framed, fits within `max_datagram_size`.
+///
+/// The kernel sets `gso_size` to the origin flow's MSS, which can exceed this
+/// connection's datagram capacity (forwarded internet traffic, jumbo-MTU paths).
+/// Lowering it makes `segment_tcp_gso_into` emit more, smaller, valid TCP
+/// segments instead of oversized ones that would be dropped. Non-TCP-GSO
+/// metadata is returned unchanged — it is never resegmented — as is the
+/// degenerate case where the header alone exceeds the cap (the per-segment
+/// safety net in `build_datagrams` drops it).
+fn clamp_gso_size_to_path(mut meta: VirtioNetHdr, max_datagram_size: usize) -> VirtioNetHdr {
+    if !meta.is_tcp_gso() {
+        return meta;
+    }
+    // Largest TCP payload whose framed plain datagram (`[type][offload_len][ip]`)
+    // fits the path: cap minus framing overhead minus the IP+TCP header bytes.
+    let max_payload = max_datagram_size
+        .saturating_sub(DATAGRAM_FRAMING_OVERHEAD)
+        .saturating_sub(usize::from(meta.hdr_len));
+    if max_payload > 0 && usize::from(meta.gso_size) > max_payload {
+        // max_payload < max_datagram_size, comfortably within u16 in practice.
+        meta.gso_size = u16::try_from(max_payload).unwrap_or(u16::MAX);
+    }
+    meta
 }
 
 /// Frame software-GRO outputs into datagrams pushed onto `pending`.
@@ -200,11 +238,23 @@ pub fn classify(dgram: &[u8]) -> VpnResult<Datagram<'_>> {
     };
     match DataMessageType::from_byte(type_byte) {
         Some(DataMessageType::IpPacket) => Ok(Datagram::Ip(rest)),
+        Some(DataMessageType::ServerAddrs) => Ok(Datagram::ServerAddrs(rest)),
         None => Err(VpnError::Signaling(format!(
             "Unknown datagram message type: 0x{:02x}",
             type_byte
         ))),
     }
+}
+
+/// Append a server-addresses datagram to `buf` (arena-style) and return the
+/// number of bytes written. Layout: `[type: 0x01] [json(ServerAddrsMsg)]`.
+pub fn encode_server_addrs_datagram(buf: &mut BytesMut, msg: &ServerAddrsMsg) -> VpnResult<usize> {
+    let body = msg.encode()?;
+    let total = 1 + body.len();
+    buf.reserve(total);
+    buf.put_u8(DataMessageType::ServerAddrs.as_byte());
+    buf.put_slice(&body);
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -235,6 +285,7 @@ mod tests {
                 assert!(offload.is_none());
                 assert_eq!(ip, &packet[..]);
             }
+            other => panic!("expected Ip, got {:?}", other),
         }
     }
 
@@ -261,6 +312,7 @@ mod tests {
                 assert_eq!(parsed, Some(offload));
                 assert_eq!(ip, &packet[..]);
             }
+            other => panic!("expected Ip, got {:?}", other),
         }
     }
 
@@ -268,6 +320,26 @@ mod tests {
     fn test_classify_empty_and_unknown() {
         assert!(classify(&[]).is_err());
         assert!(classify(&[0x7f]).is_err());
+    }
+
+    #[test]
+    fn test_server_addrs_datagram_roundtrip() {
+        let msg = ServerAddrsMsg::new(vec![
+            "203.0.113.5".parse().expect("parse v4"),
+            "2001:db8::1".parse().expect("parse v6"),
+        ]);
+        let mut buf = BytesMut::new();
+        let written = encode_server_addrs_datagram(&mut buf, &msg).expect("encode");
+        assert_eq!(written, buf.len());
+        assert_eq!(buf[0], DataMessageType::ServerAddrs.as_byte());
+
+        match classify(&buf).expect("classify") {
+            Datagram::ServerAddrs(body) => {
+                let decoded = ServerAddrsMsg::decode(body).expect("decode body");
+                assert_eq!(decoded, msg);
+            }
+            other => panic!("expected ServerAddrs, got {:?}", other),
+        }
     }
 
     #[test]
@@ -366,13 +438,52 @@ mod tests {
     }
 
     #[test]
-    fn test_gso_segments_exceeding_cap_are_dropped() {
-        // gso_size 1200 produces ~1240-byte framed segments; a cap below that
-        // must drop every segment rather than emit an oversized datagram.
-        let packet = build_ipv4_tcp_packet(3500);
-        let offload = tcp_gso_header();
+    fn test_gso_oversized_gso_size_resegmented_to_fit() {
+        // Regression: when the kernel's gso_size exceeds the path's
+        // max_datagram_size (forwarded internet / jumbo-MTU traffic), segments
+        // must be re-cut to fit rather than dropped. Here a 1460-MSS super-frame
+        // is sent over a 1414-byte cap (smaller than even one MSS segment).
+        let mut offload = tcp_gso_header();
+        offload.gso_size = 1460;
+        let payload_len = 3000;
+        let packet = build_ipv4_tcp_packet(payload_len);
         let (mut arena, mut scratch, mut pending) = (BytesMut::new(), Vec::new(), Vec::new());
-        let cap = 100;
+        let cap = 1414;
+
+        build_datagrams(
+            &mut arena,
+            &mut scratch,
+            &mut pending,
+            Some(&offload),
+            &packet,
+            false, // peer cannot take offload metadata -> must segment
+            cap,
+        )
+        .expect("frame");
+
+        assert!(!pending.is_empty(), "oversized gso_size must resegment, not drop");
+        let mut total_payload = 0usize;
+        for d in &pending {
+            assert!(d.len() <= cap, "datagram {} exceeds cap {}", d.len(), cap);
+            assert_eq!(d[1], 0, "segmented datagrams carry no offload metadata");
+            // d = [type][offload_len=0][ip(20) + tcp(20) + payload]
+            total_payload += d.len() - DATAGRAM_FRAMING_OVERHEAD - 40;
+        }
+        assert_eq!(
+            total_payload, payload_len,
+            "resegmentation must preserve the full TCP payload"
+        );
+    }
+
+    #[test]
+    fn test_gso_segments_dropped_only_when_header_exceeds_cap() {
+        // The sole remaining drop case: a cap so small the IP/TCP header alone
+        // (plus framing) does not fit, so no payload byte can ride. gso_size
+        // cannot be lowered enough, and the per-segment safety net drops it.
+        let packet = build_ipv4_tcp_packet(3500);
+        let offload = tcp_gso_header(); // hdr_len 40
+        let (mut arena, mut scratch, mut pending) = (BytesMut::new(), Vec::new(), Vec::new());
+        let cap = 42; // == DATAGRAM_FRAMING_OVERHEAD (2) + header (40); zero payload room
 
         build_datagrams(
             &mut arena,
@@ -387,7 +498,7 @@ mod tests {
 
         assert!(
             pending.is_empty(),
-            "segments exceeding the cap must be dropped, got {}",
+            "segments must be dropped when the header alone exceeds the cap, got {}",
             pending.len()
         );
     }

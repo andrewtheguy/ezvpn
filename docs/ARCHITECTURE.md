@@ -2,6 +2,20 @@
 
 `ezvpn` provides full-network tunneling using direct IP-over-QUIC. It creates a TUN device and routes IP traffic directly through encrypted iroh QUIC connections, eliminating double-encryption overhead while preserving TLS 1.3 security.
 
+The primary deployment model is remote access to private resources without
+opening inbound ports on the VPN server. In practice that usually means running
+an `ezvpn` server inside a private network, such as an AWS VPC, so a home or
+remote client can reach private AWS resources or hosts in private/egress-only
+subnets. Split routing to explicit private prefixes is the main design target.
+Full-tunnel default routing is supported, but remains more experimental because
+it interacts with broad host routes and the underlay bypass routes needed for
+iroh server and relay addresses.
+
+Anonymity is not a design goal. iroh's relay/discovery infrastructure can
+observe connection metadata when it is used for signaling or for carrying
+encrypted traffic. The tunneled payload is still end-to-end encrypted by
+QUIC/TLS 1.3, so relay operators cannot decrypt the VPN data.
+
 ## VPN Mode
 
 > **Note:** VPN mode requires root/admin privileges. On Windows, you also need `wintun.dll` from https://www.wintun.net/ (official WireGuard project) — download the zip, extract, and copy `wintun/bin/amd64/wintun.dll` to the same directory as the executable (or any directory in the system PATH).
@@ -279,33 +293,143 @@ and feed them back into the tunnel, deadlocking the connection. To prevent this,
 peer address, pinned to the underlay default gateway captured before the VPN
 routes were installed (`BypassRouteManager` in `tunnel/client.rs`).
 
-**The bypass manager is add-only.** A bypass route, once installed, is kept until
-the connection closes (each route guard's `Drop` removes it). It is deliberately
-*not* removed when iroh drops the peer from a path snapshot: iroh flaps underlay
-peers in and out of successive snapshots, so removing on first absence caused
-add/remove churn, and between removals the address was self-captured into the
-tunnel — the exact failure the bypass exists to prevent. A bypass route only
-pins one peer's underlay address (the server's transport address) off the
-tunnel, so keeping a no-longer-listed one for the session is harmless.
+The trigger is purely topological: *any* underlay address the transport may use
+that overlaps a routed prefix needs the bypass, independent of how that address
+is reachable. An ingress+egress server address and an egress-only one (reached
+via stateful NAT/hole-punching) both form direct paths that self-capture without
+the bypass — reachability only governs whether a direct path forms at all, not
+whether a candidate address needs pinning.
 
-Only the addresses iroh actually uses for transport are ever bypassed: the
-manager's required set comes from `collect_addresses_from_paths`, i.e. the
-connection's direct remote addresses (the server's underlay address) and any
-relay it falls back to — never arbitrary destinations. So a bypass pins **only
-that one transport endpoint, not the rest of the routed prefix**: other hosts
-inside the same CIDR still route through the VPN normally. In a full tunnel
-(`0.0.0.0/0`/`::/0`) the server and relay addresses are always covered and thus
-always pinned; in a split tunnel only an endpoint that overlaps a routed CIDR is.
+**Two address sources, no path-snapshot watch.** The client learns the addresses
+to bypass from exactly two sources:
+
+1. **Eager relay bootstrap (one-time, client-side).** Before the VPN routes are
+   installed, the client resolves its full relay set (configured relay URLs, or
+   the default relay map) for both families and pins each address a VPN route
+   would capture. This guarantees the relay fallback path survives route
+   installation, with no startup race to wait on (`add_iroh_bypass_routes`).
+2. **Server-published candidate addresses (server-driven).** The server's own
+   candidate underlay addresses (`endpoint.addr().ip_addrs()`) reach the client
+   in the handshake response (seeded into the manager at onboarding, before VPN
+   routes go in) and then ongoing over the data path — every
+   `SERVER_ADDR_PUBLISH_INTERVAL` (30s) for loss tolerance, and promptly whenever
+   `Endpoint::watch_addr()` reports a change. The client merges each set into the
+   manager. These addresses are authoritative: they need no DNS and no
+   path-selection race, so they pre-empt the self-capture of a server address
+   iroh has discovered but not yet selected for the active path. See "Server
+   Address Publication" below.
+
+The client deliberately does **not** watch iroh's per-connection path snapshots
+to discover addresses. That watch was unreliable — it blocked on inline relay
+DNS and only ever saw the latest coalesced snapshot, so a server address that
+appeared transiently was missed — and is fully superseded by the server's
+authoritative publication. See "Server Address Publication" below.
+
+**The bypass manager is add-only.** A bypass route, once installed, is kept until
+the connection closes (each route guard's `Drop` removes it). A published set
+that omits an address never removes its route: the published set can fluctuate as
+the server's discovered addresses change, and removing on first absence would
+cause add/remove churn, self-capturing the address into the tunnel in between —
+the exact failure the bypass exists to prevent. A bypass route only pins one
+peer's underlay address (the server's transport address) off the tunnel, so
+keeping a no-longer-listed one for the session is harmless.
+
+**Application is best-effort and per-address, not a transaction.**
+`BypassRouteManager::update` adds each required address independently: a
+committed bypass is kept, and a failure to add one address is logged and skipped
+rather than aborting the rest. The required set is the full resolved relay map
+(both address families) plus the server's published candidate addresses, so a
+single address that transiently cannot be pinned — e.g. a relay whose per-IP
+route is briefly a gateway-less cloned entry during startup — must not block
+pinning the endpoint iroh actually selected. In a full tunnel an aborted batch
+would leave the live transport captured into the tunnel and stall the connection.
+
+**Gateway resolution falls back to the captured default gateway.** A bypass must
+be pinned to a real next-hop gateway; a gateway-less (link-scope) host route
+would black-hole the address. When the freshly queried per-IP route either
+resolves through the VPN tunnel itself (a direct path discovered *after* the VPN
+routes went up) or resolves via a physical interface but yields no next-hop
+gateway (a transient cloned-route state), `ezvpn` re-pins via the underlay
+default gateway captured while the routing table was still pristine
+(`resolve_bypass_route_info` in `net/device.rs`). Only if no usable captured
+gateway exists is the bypass refused.
+
+Both the best-effort application and the gateway fallback live in the
+cross-platform layer (`update` and `resolve_bypass_route_info`); the
+per-platform code (`add_bypass_route_impl`) only issues the single host-route
+add, so the behavior is identical on Linux, macOS, and Windows.
+
+Only addresses iroh *may use* for transport are ever bypassed: the manager's
+required set is the resolved relay set plus the server's published candidate
+underlay addresses — never arbitrary destinations. That candidate set is the
+server's full address enumeration (both families, **public and private** — a peer
+on the same private network reaches the server over its private address), so it
+legitimately includes private/LAN addresses; which one a given client actually
+uses depends on where it connects from. The server **excludes its own VPN overlay
+addresses** (its tun-subnet gateway, e.g. `10.99.0.1` / `fd11:…::1`) from the set:
+those are overlay, never underlay transport, so pinning them off the tunnel would
+be wrong (`server_candidate_addrs` in `tunnel/server.rs`). A bypass pins **only those transport
+endpoints, not the rest of the routed prefix**: other hosts inside the same CIDR
+still route through the VPN normally. In a full tunnel (`0.0.0.0/0`/`::/0`) the
+server and relay addresses are always covered and thus always pinned; in a split
+tunnel only an endpoint that overlaps a routed CIDR is.
 
 **Caveat (user-visible).** As a consequence, the one address used for tunnel
 transport is reachable only over the underlay, not through the VPN, while the
 client is connected. If that same host also exposes resources meant to be reached
 *through* the tunnel, those must be addressed by their **VPN-internal IP** (the
 in-subnet server/peer address, e.g. `10.x` / `fd11:…`) — not by the public
-address that doubles as the tunnel underlay endpoint. This is documented for end
-users in the README "Routing" section.
+address that doubles as the tunnel underlay endpoint.
+
+The most confusing instance is the **VPN server itself**: because the pinned
+address is the server's *own* transport endpoint, an identical-looking public
+address (e.g. an egress-only IPv6) is reachable through the tunnel on *any other*
+host but **not** on the VPN server, where it is pinned to the underlay. This
+asymmetry reads as a bug but is expected — the server's address doubles as the
+tunnel underlay endpoint, so reach the server by its VPN-internal subnet IP
+instead. This is documented for end users in the README "Routing" section.
+
+### Server Address Publication
+
+The server is the authoritative source of its own underlay addresses, so it
+publishes them to each connected client instead of having the client guess from
+iroh path snapshots. The candidate IP set comes from `endpoint.addr()`, minus the
+server's own VPN overlay addresses (iroh enumerates every local interface,
+including the server's tun, so its overlay gateway is filtered out — see
+`server_candidate_addrs`). It reaches the client two ways:
+
+- **At onboarding, in the handshake response** (`VpnHandshakeResponse.server_addrs`,
+  reliable bi-stream). The client seeds these into its bypass manager during
+  setup — alongside the eager relay bootstrap, before VPN routes are installed —
+  so a direct server address that a VPN route would capture is pinned
+  immediately, with no wait for the first periodic publication.
+- **Ongoing, over the data path** (`ServerAddrsMsg`, datagram type `0x01`). A
+  per-connection task (`run_server_addr_publisher`) sends it once immediately on
+  connect, then every `SERVER_ADDR_PUBLISH_INTERVAL` (30s) as a loss-tolerance
+  floor, and promptly on any `Endpoint::watch_addr()` change. It rides the same
+  unreliable datagram path as IP traffic and self-terminates when the connection
+  closes.
+
+The client feeds every received set (handshake or datagram) into its bypass
+manager (add-only, filtered to VPN-covered IPs); a dropped publication is
+recovered by the next tick, and addresses discovered after onboarding arrive via
+the datagram path.
+
+The feature is wire-compatible and needs no protocol-version bump: the message
+is a new datagram *type*, and a peer that does not understand `0x01` simply drops
+it (the client ignores it when it installs no capturing routes; an old server
+never sends it). A client talking to an old server therefore falls back to the
+eager relay bootstrap alone — it will not learn the server's *direct* underlay
+address, so a direct path that overlaps a routed prefix would self-capture; run a
+server built with this feature to bypass direct server addresses in a full tunnel.
 
 ### Security Model
+
+The security model is private-resource access, not anonymity. Server identity,
+the ALPN knock token, auth tokens, and QUIC/TLS encryption protect the tunnel
+from unauthorized peers and keep VPN payloads confidential from iroh relays.
+Relays and discovery services may still see metadata such as participating
+endpoints, timing, volume, and relay use when they are involved.
 
 ```mermaid
 graph TB

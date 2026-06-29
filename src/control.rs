@@ -81,6 +81,11 @@ pub struct ServerStatus {
     pub clients: Vec<ClientEntry>,
     /// Packet flow counters.
     pub stats: ServerStatsView,
+    /// The server's candidate iroh underlay addresses, as published to clients
+    /// for bypass routing (`endpoint.addr().ip_addrs()`). Debugging aid: these
+    /// are what the server advertises, not routes installed on any client.
+    #[serde(default)]
+    pub bypass_addrs: Vec<String>,
 }
 
 /// A single connected client as seen by the server.
@@ -154,6 +159,13 @@ pub struct ClientStatus {
     pub routes6: Vec<String>,
     /// iroh connection path(s) to the server (direct/relay, addresses).
     pub connection: Option<String>,
+    /// Underlay bypass addresses the client has *collected* this session (relays
+    /// resolved at startup + the server's published candidates), filtered to
+    /// those a VPN route would capture. Debugging aid: collected ≠ applied — an
+    /// entry here may have failed to install as an OS route (see the disclaimer
+    /// in the printed output).
+    #[serde(default)]
+    pub bypass_addrs: Vec<String>,
     /// Daemon log-file path (set only when started with `--daemon`).
     #[serde(default)]
     pub log_file: Option<String>,
@@ -186,6 +198,13 @@ pub struct ClientConnectedInfo {
 /// stays transport-agnostic. Called on demand when a snapshot is built.
 pub type ConnectionProbe = Arc<dyn Fn() -> String + Send + Sync>;
 
+/// Probe returning the bypass addresses the client has collected this session.
+///
+/// Provided by the client (capturing the bypass manager's shared collected set)
+/// so this module stays transport-agnostic. Called on demand when a snapshot is
+/// built. The returned addresses are *collected*, not necessarily *applied*.
+pub type BypassRoutesProbe = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// Internal shared client state. `connected_at` is a monotonic `Instant`, so it
 /// is kept here rather than in the serializable [`ClientStatus`].
 struct ClientStateInner {
@@ -196,6 +215,7 @@ struct ClientStateInner {
     connected_at: Option<std::time::Instant>,
     info: ClientConnectedInfo,
     connection_probe: Option<ConnectionProbe>,
+    bypass_routes_probe: Option<BypassRoutesProbe>,
     /// Daemon log-file path (set only when started with `--daemon`).
     log_file: Option<String>,
 }
@@ -220,6 +240,7 @@ impl ClientStatusHandle {
                 connected_at: None,
                 info: ClientConnectedInfo::default(),
                 connection_probe: None,
+                bypass_routes_probe: None,
                 log_file: None,
             })),
         }
@@ -232,13 +253,20 @@ impl ClientStatusHandle {
     }
 
     /// Mark the client connected with the given session details. `connection`
-    /// is a probe that yields a live description of the iroh path(s).
-    pub fn set_connected(&self, info: ClientConnectedInfo, connection: ConnectionProbe) {
+    /// is a probe that yields a live description of the iroh path(s); `bypass`
+    /// (when present) yields the bypass addresses collected this session.
+    pub fn set_connected(
+        &self,
+        info: ClientConnectedInfo,
+        connection: ConnectionProbe,
+        bypass: Option<BypassRoutesProbe>,
+    ) {
         let mut guard = self.inner.write().expect("client status lock poisoned");
         guard.connected = true;
         guard.connected_at = Some(std::time::Instant::now());
         guard.info = info;
         guard.connection_probe = Some(connection);
+        guard.bypass_routes_probe = bypass;
     }
 
     /// Mark the client disconnected (e.g. tunnel ended, awaiting reconnect).
@@ -248,6 +276,7 @@ impl ClientStatusHandle {
         guard.connected_at = None;
         guard.info = ClientConnectedInfo::default();
         guard.connection_probe = None;
+        guard.bypass_routes_probe = None;
     }
 
     /// Build the current snapshot wrapped for the control protocol.
@@ -261,7 +290,17 @@ impl ClientStatusHandle {
         // drop the guard before invoking the probe. The probe may call into
         // iroh and block, so it must not run while holding the lock (which
         // would stall `set_connected`/`set_disconnected`).
-        let (instance, connected, server_node_id, device_id, connected_at, info, probe, log_file) = {
+        let (
+            instance,
+            connected,
+            server_node_id,
+            device_id,
+            connected_at,
+            info,
+            probe,
+            bypass_probe,
+            log_file,
+        ) = {
             let guard = self.inner.read().expect("client status lock poisoned");
             (
                 guard.instance.clone(),
@@ -271,6 +310,7 @@ impl ClientStatusHandle {
                 guard.connected_at,
                 guard.info.clone(),
                 guard.connection_probe.clone(),
+                guard.bypass_routes_probe.clone(),
                 guard.log_file.clone(),
             )
         };
@@ -306,6 +346,7 @@ impl ClientStatusHandle {
             routes: info.routes,
             routes6: info.routes6,
             connection: probe.map(|probe| probe()),
+            bypass_addrs: bypass_probe.map(|p| p()).unwrap_or_default(),
             log_file,
         }
     }
@@ -663,6 +704,12 @@ fn print_server_text(s: &ServerStatus) {
     }
     println!("Clients:        {}", s.connected_clients);
     println!("Active conns:   {}", s.active_connections);
+    if s.bypass_addrs.is_empty() {
+        println!("Bypass addrs:   (none discovered yet)");
+    } else {
+        println!("Bypass addrs:   {}", s.bypass_addrs.join(", "));
+        println!("                (published to clients for bypass routing)");
+    }
     if !s.clients.is_empty() {
         println!("\nConnected clients:");
         for c in &s.clients {
@@ -731,6 +778,17 @@ fn print_client_text(c: &ClientStatus) {
         if let Some(conn) = &c.connection {
             println!("Connection:     {conn}");
         }
+        if c.bypass_addrs.is_empty() {
+            println!("Bypass addrs:   (none collected)");
+        } else {
+            println!("Bypass addrs:   {}", c.bypass_addrs.join(", "));
+            println!(
+                "                (collected, not necessarily applied successfully;"
+            );
+            println!(
+                "                 verify with the OS routing table, e.g. netstat -nr)"
+            );
+        }
     }
 }
 
@@ -781,6 +839,7 @@ mod tests {
                 packets_spoofed: 0,
                 packets_inter_client_blocked: 0,
             },
+            bypass_addrs: vec!["44.230.20.120".into()],
         });
         let bytes = serde_json::to_vec(&snap).expect("serialize");
         let back: StatusSnapshot = serde_json::from_slice(&bytes).expect("deserialize");
@@ -815,6 +874,7 @@ mod tests {
                 ..Default::default()
             },
             Arc::new(|| "relay https://relay.example".to_string()),
+            Some(Arc::new(|| vec!["198.51.100.7".to_string()])),
         );
         let snap = handle.client_status();
         assert_eq!(snap.state, "connected");
@@ -824,11 +884,13 @@ mod tests {
         assert_eq!(snap.gso_negotiated, Some(true));
         assert_eq!(snap.routes, vec!["0.0.0.0/0".to_string()]);
         assert_eq!(snap.connection.as_deref(), Some("relay https://relay.example"));
+        assert_eq!(snap.bypass_addrs, vec!["198.51.100.7".to_string()]);
 
         handle.set_disconnected();
         let snap = handle.client_status();
         assert_eq!(snap.state, "disconnected");
         assert!(snap.connection.is_none());
+        assert!(snap.bypass_addrs.is_empty());
     }
 
     // Exercises `socket_path`, which only exists on Unix; the Windows control
@@ -907,6 +969,7 @@ mod tests {
                     packets_spoofed: 0,
                     packets_inter_client_blocked: 0,
                 },
+                bypass_addrs: vec![],
             })
         };
         let guard = spawn_status_listener(LockRole::Server, &instance, provider)

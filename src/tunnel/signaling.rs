@@ -11,7 +11,7 @@ use crate::config::file_config::{CongestionController, TransportTuning};
 use crate::tunnel::offload::{VIRTIO_NET_HDR_LEN, VirtioNetHdr};
 use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// VPN protocol version.
 pub const VPN_PROTOCOL_VERSION: u16 = 3;
@@ -175,6 +175,14 @@ pub struct VpnHandshakeResponse {
     /// Rejection reason (if not accepted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reject_reason: Option<String>,
+    /// Server's candidate iroh underlay addresses (`endpoint.addr().ip_addrs()`),
+    /// delivered in the handshake so the client can install bypass routes for any
+    /// a VPN route would capture *at onboarding* — without waiting for the first
+    /// periodic data-path publication (see [`ServerAddrsMsg`]). Ongoing changes
+    /// still arrive via that publication. Empty/absent when the server has not yet
+    /// discovered any (or is an older build): the client falls back to publishing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_addrs: Vec<IpAddr>,
 }
 
 impl VpnHandshakeResponse {
@@ -221,6 +229,7 @@ impl VpnHandshakeResponse {
             network6: None,
             server_ip6: None,
             reject_reason: None,
+            server_addrs: Vec::new(),
         }
     }
 
@@ -250,6 +259,7 @@ impl VpnHandshakeResponse {
             network6: Some(network6),
             server_ip6: Some(server_ip6),
             reject_reason: None,
+            server_addrs: Vec::new(),
         }
     }
 
@@ -277,6 +287,7 @@ impl VpnHandshakeResponse {
             network6: Some(network6),
             server_ip6: Some(server_ip6),
             reject_reason: None,
+            server_addrs: Vec::new(),
         }
     }
 
@@ -298,7 +309,19 @@ impl VpnHandshakeResponse {
             network6: None,
             server_ip6: None,
             reject_reason: Some(reason.into()),
+            server_addrs: Vec::new(),
         }
+    }
+
+    /// Attach the server's candidate underlay addresses to an accepted response.
+    ///
+    /// Builder-style so the per-family constructors stay unchanged; a no-op on a
+    /// rejected response (the client ignores everything but `reject_reason`).
+    pub fn with_server_addrs(mut self, server_addrs: Vec<IpAddr>) -> Self {
+        if self.accepted {
+            self.server_addrs = server_addrs;
+        }
+        self
     }
 
     /// Encode to bytes for transmission.
@@ -374,11 +397,17 @@ pub const MAX_HANDSHAKE_SIZE: usize = 16 * 1024;
 /// The datagram boundary is the message length, so there is no length prefix:
 /// the leading byte is the message type and the remainder is type-specific.
 /// IP packet layout: `[0x00] [offload_len: 1] [offload: 0|10] [ip_packet]`.
+/// Server-addresses layout: `[0x01] [json(ServerAddrsMsg)]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DataMessageType {
     /// IP packet datagram.
     IpPacket = 0x00,
+    /// Server-published set of candidate iroh underlay addresses (server →
+    /// client only). The client installs bypass routes for any that a VPN route
+    /// would otherwise capture, pre-empting self-capture of a server address
+    /// iroh has not yet selected (see [`ServerAddrsMsg`]).
+    ServerAddrs = 0x01,
 }
 
 impl DataMessageType {
@@ -386,6 +415,7 @@ impl DataMessageType {
     pub fn from_byte(b: u8) -> Option<Self> {
         match b {
             0x00 => Some(Self::IpPacket),
+            0x01 => Some(Self::ServerAddrs),
             _ => None,
         }
     }
@@ -393,6 +423,40 @@ impl DataMessageType {
     /// Convert to byte value.
     pub const fn as_byte(self) -> u8 {
         self as u8
+    }
+}
+
+/// Server → client publication of the candidate iroh underlay addresses the
+/// server may be reached on (`endpoint.addr().ip_addrs()`).
+///
+/// The client only ever *adds* bypass routes for those covered by a VPN route
+/// (see `BypassRouteManager::update`), so the server can publish its full
+/// candidate set — including private/LAN addresses — without the client pinning
+/// anything outside the routed range. This lets the client pre-empt the
+/// self-capture of a server address iroh has discovered but not yet selected for
+/// the active path, which the path-snapshot-driven discovery alone would miss.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerAddrsMsg {
+    /// Candidate underlay IP addresses (ports stripped; bypass routes are per-IP).
+    pub addrs: Vec<IpAddr>,
+}
+
+impl ServerAddrsMsg {
+    /// Create a new message from a set of candidate addresses.
+    pub fn new(addrs: Vec<IpAddr>) -> Self {
+        Self { addrs }
+    }
+
+    /// Encode to bytes (the datagram body after the message-type byte).
+    pub fn encode(&self) -> VpnResult<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|e| VpnError::Signaling(format!("Failed to encode server addrs: {}", e)))
+    }
+
+    /// Decode from bytes (the datagram body after the message-type byte).
+    pub fn decode(data: &[u8]) -> VpnResult<Self> {
+        serde_json::from_slice(data)
+            .map_err(|e| VpnError::Signaling(format!("Failed to decode server addrs: {}", e)))
     }
 }
 
@@ -580,6 +644,30 @@ mod tests {
         assert_eq!(decoded.network6, Some(network6));
         assert_eq!(decoded.server_ip6, Some(server_ip6));
         assert_eq!(decoded.reject_reason, None);
+        assert!(decoded.server_addrs.is_empty());
+    }
+
+    #[test]
+    fn test_response_server_addrs_roundtrip() {
+        let addrs = vec![
+            "44.230.20.120".parse::<IpAddr>().expect("parse v4"),
+            "2600:1f13:adc:a0b1:feb9:cb56:f64e:b6f8"
+                .parse::<IpAddr>()
+                .expect("parse v6"),
+        ];
+        let response = VpnHandshakeResponse::accepted(
+            "10.0.0.2".parse().expect("parse IPv4"),
+            "10.0.0.0/24".parse().expect("parse network"),
+            "10.0.0.1".parse().expect("parse server ip"),
+            false,
+            WireTransport::default(),
+            1440,
+        )
+        .with_server_addrs(addrs.clone());
+
+        let encoded = response.encode().expect("encode response");
+        let decoded = VpnHandshakeResponse::decode(&encoded).expect("decode response");
+        assert_eq!(decoded.server_addrs, addrs);
     }
 
     #[test]
@@ -636,6 +724,7 @@ mod tests {
             network6: None,
             server_ip6: None,
             reject_reason: None,
+            server_addrs: Vec::new(),
         };
 
         assert!(!response.is_valid());
@@ -731,11 +820,15 @@ mod tests {
         assert_eq!(msg_type, DataMessageType::IpPacket);
         let back: u8 = msg_type.into();
         assert_eq!(back, 0x00);
+
+        let msg_type = DataMessageType::from_byte(0x01).expect("valid message type");
+        assert_eq!(msg_type, DataMessageType::ServerAddrs);
+        assert_eq!(msg_type.as_byte(), 0x01);
     }
 
     #[test]
     fn test_data_message_type_invalid_bytes() {
-        for invalid in [0x01, 0x02, 0x03, 0x10, 0x80, 0xff] {
+        for invalid in [0x02, 0x03, 0x10, 0x80, 0xff] {
             assert!(
                 DataMessageType::from_byte(invalid).is_none(),
                 "from_byte(0x{:02x}) should return None",
@@ -745,8 +838,20 @@ mod tests {
     }
 
     #[test]
+    fn test_server_addrs_msg_roundtrip() {
+        let addrs = vec![
+            "203.0.113.5".parse::<IpAddr>().expect("parse v4"),
+            "2001:db8::1".parse::<IpAddr>().expect("parse v6"),
+        ];
+        let msg = ServerAddrsMsg::new(addrs.clone());
+        let encoded = msg.encode().expect("encode server addrs");
+        let decoded = ServerAddrsMsg::decode(&encoded).expect("decode server addrs");
+        assert_eq!(decoded.addrs, addrs);
+    }
+
+    #[test]
     fn test_data_message_type_try_from_invalid() {
-        for invalid in [0x01, 0x10, 0x80, 0xff] {
+        for invalid in [0x02, 0x10, 0x80, 0xff] {
             let result: Result<DataMessageType, _> = invalid.try_into();
             assert!(result.is_err(), "TryFrom(0x{:02x}) should fail", invalid);
 

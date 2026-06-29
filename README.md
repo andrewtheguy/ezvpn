@@ -15,6 +15,25 @@ open inbound ports. Relay fallback is used when a direct path is unavailable.
 > Running `ezvpn` requires root/Administrator privileges to create TUN devices
 > and routes.
 
+## Project Scope
+
+The primary use case for `ezvpn` is easy access to private resources from home
+or another external network without opening inbound ports on the VPN server. A
+typical deployment is a small `ezvpn` server inside a private network, such as
+an AWS VPC, where clients need to reach private AWS resources or instances in
+private/egress-only subnets.
+
+`ezvpn` is not an anonymity network. If the default iroh relay/discovery
+infrastructure is used, iroh relay operators can observe connection metadata
+when relays are used for signaling or for carrying encrypted traffic. The VPN
+payload remains end-to-end encrypted over QUIC/TLS 1.3, so relay operators
+cannot decrypt the tunneled data.
+
+Full-tunnel routing (`0.0.0.0/0` and `::/0`) is supported, but it is still more
+experimental than routing explicit private prefixes. Full tunneling touches more
+of the host routing table and depends on bypass routes that keep the iroh
+underlay path to the server and relay infrastructure outside the VPN route.
+
 ## Features
 
 - Full subnet routing, not just single-port forwarding
@@ -31,6 +50,10 @@ open inbound ports. Relay fallback is used when a direct path is unavailable.
 
 Use `ezvpn` when you need:
 
+- Home or remote access to private cloud/VPC/LAN resources without opening
+  inbound firewall ports on the VPN server
+- Access to AWS resources that live behind private routes or in egress-only
+  subnets, using an `ezvpn` server inside that network as the gateway
 - Access to an entire remote subnet
 - Stable full-network routing between peers behind NAT
 - Cross-platform VPN connectivity on Linux, macOS, and Windows
@@ -50,6 +73,11 @@ another. Here every client only ever talks to the server gateway, so assigned
 IPs carry no such guarantee and the whole class of stale-IP and address-collision
 bookkeeping disappears. So do not use `ezvpn` for site-to-site routing between
 two LANs or for direct client-to-client traffic.
+
+Also do not use `ezvpn` when the goal is anonymity. iroh's relays can see relay
+metadata when they are involved, even though the VPN payload remains encrypted.
+For the most predictable routing behavior today, prefer split routes to the
+private resources you need over full-tunnel default routes.
 
 ## Installation
 
@@ -355,6 +383,11 @@ sudo ezvpn client start \
   --route6 ::/0
 ```
 
+Full tunnel mode is the experimental path. It is useful for testing and for
+controlled environments, but private-prefix split routing is the primary design
+target because it avoids many broad-route interactions with iroh server and relay
+bypass routes.
+
 Default routes are installed as split half-routes (`0.0.0.0/1` +
 `128.0.0.0/1`, and `::/1` + `8000::/1`) so the system default route is not
 removed. On Linux, macOS, and Windows, `ezvpn` also installs host-specific
@@ -366,18 +399,36 @@ the host route is pinned with `New-NetRoute`.
 
 ### Caveat: the transport endpoint address is pinned off the tunnel
 
-The bypass route is installed **only for the exact address iroh uses to carry
-the tunnel** — the server's underlay address, plus any relay the connection
-falls back to — and **only when that address happens to fall inside one of your
-routed CIDRs**. A common example is the server's AWS public IPv6 when you route a
-`2600:1f13:adc::/…` prefix that contains it. `ezvpn` pins a `/32`/`/128` bypass
-host route for that single address so the QUIC tunnel's own underlay packets are
-not fed back into the tunnel (which would deadlock the connection). The bypass is
-installed for the lifetime of the session and is **not** removed mid-session.
+The bypass routes are installed for the addresses iroh **may use to carry the
+tunnel** — the server's *candidate* underlay addresses (every address iroh
+enumerates, across IPv4 *and* IPv6 and including **private** ones — a peer that
+connects from the same private network uses the private address for transport),
+plus any relay the connection can fall back to — and **only for those that fall
+inside one of your routed CIDRs**. A common example is the server's AWS public
+IPv6 when you route a `2600:1f13:adc::/…` prefix that contains it. `ezvpn` pins a
+`/32`/`/128` bypass host route for each such address so the QUIC tunnel's own
+underlay packets are not fed back into the tunnel (which would deadlock the
+connection). The bypasses are installed for the lifetime of the session and are
+**not** removed mid-session.
 
-This affects **only that one transport address — not the rest of the prefix.**
+**This is the same principle as any traditional VPN** — it just has less
+visibility here. A conventional client (OpenVPN, WireGuard, IPsec) must also keep
+packets to the VPN *gateway's own address* off the tunnel; otherwise the
+encrypted transport gets routed into the very tunnel it carries and the link
+deadlocks. There it's obvious and singular: you type in one endpoint IP, and the
+client pins exactly one host route to it via the physical gateway. `ezvpn` does
+the identical thing, but the transport endpoint is **not** a single static IP you
+configured — iroh discovers it at runtime and may use several of the server's
+addresses (IPv4 *and* IPv6) and fall back to public **relay servers**. So instead
+of one hand-configured bypass you can see, `ezvpn` pins a *set* of addresses: the
+server's own underlay addresses, which the server **publishes to the client**
+over the connection, together with the resolved IPs of the client's preconfigured
+list of relays. That larger, runtime-determined set is exactly why the effect is
+easy to miss and worth spelling out below.
+
+This affects **only those transport addresses — not the rest of the prefix.**
 Other hosts inside the same routed CIDR still route through the VPN normally; only
-the address iroh is actively using as its underlay endpoint is pinned. (In a full
+the server's candidate underlay addresses (and relays) are pinned. (In a full
 tunnel, `0.0.0.0/0`/`::/0` covers everything, so the server and relay addresses
 are always pinned — but those are iroh infrastructure, not resources you address
 directly.)
@@ -387,17 +438,31 @@ not through the VPN**, for as long as the client is connected. If that same host
 also serves resources you want to reach *through* the tunnel, do not address them
 by that public IP — it will skip the VPN.
 
-Instead, **access in-VPN resources by their VPN-internal address** (the
-server/peer's address inside the VPN subnet, e.g. `10.99.0.1` /
-`fd11:9a0b:1095:99::1`). Reserving the public address purely for tunnel transport
-and using VPN IPs for actual traffic avoids the ambiguity entirely.
+**The surprising case is the VPN server itself.** The pinned address is the
+server's *own* transport endpoint, so you get an asymmetry that looks like a bug
+but isn't: a given public address (e.g. an egress-only IPv6) on **any other
+host** is reachable through the tunnel as normal, yet the **same kind of address
+on the VPN server** is the one pinned off the tunnel and reachable only over the
+underlay. "I can hit this egress-only IPv6 on host X through the VPN, but not the
+identical-looking one on the VPN server" is therefore expected — the only
+difference is that the server's address doubles as the tunnel's underlay
+endpoint, so it must stay off the tunnel.
 
-> Earlier versions tried to *remove* the bypass route whenever iroh dropped that
-> peer from its path set, in an attempt to restore direct access to the public
-> address. Because iroh flaps underlay peers in and out of its path snapshots,
-> this caused the route to churn (repeated add/remove), and between removals the
-> address was self-captured into the tunnel — flaky for both uses. The bypass is
-> now stable for the session; use the VPN IP for in-tunnel access.
+Instead, **access the VPN server (and any in-VPN resource) by its VPN-internal
+address** (the server/peer's address inside the VPN subnet, e.g. `10.99.0.1` /
+`fd11:9a0b:1095:99::1`), not its public IP. Reserving the public address purely
+for tunnel transport and using VPN IPs for actual traffic avoids the ambiguity
+entirely.
+
+> Earlier versions discovered the address by watching iroh's per-connection path
+> snapshots and tried to *remove* the bypass when the peer dropped out of the set.
+> Because iroh flaps underlay peers in and out of those snapshots, this both
+> missed addresses that appeared only briefly and churned the route (repeated
+> add/remove), self-capturing the address into the tunnel between removals. The
+> server now **publishes** its underlay addresses to the client directly, and the
+> bypass is stable for the session; use the VPN IP for in-tunnel access. (Pinning
+> the server's *direct* address requires a server built with this feature; older
+> servers still bypass relays only.)
 
 ## Protocol, MTU, and GSO
 
