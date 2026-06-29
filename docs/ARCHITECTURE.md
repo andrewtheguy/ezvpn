@@ -279,6 +279,13 @@ and feed them back into the tunnel, deadlocking the connection. To prevent this,
 peer address, pinned to the underlay default gateway captured before the VPN
 routes were installed (`BypassRouteManager` in `tunnel/client.rs`).
 
+The trigger is purely topological: *any* direct path whose underlay address
+overlaps a routed prefix needs the bypass, independent of how that address is
+reachable. An ingress+egress server address and an egress-only one (reached via
+stateful NAT/hole-punching) both form direct paths that self-capture without the
+bypass — reachability only governs whether a direct path forms at all, not
+whether a formed path needs pinning.
+
 **The bypass manager is add-only.** A bypass route, once installed, is kept until
 the connection closes (each route guard's `Drop` removes it). It is deliberately
 *not* removed when iroh drops the peer from a path snapshot: iroh flaps underlay
@@ -287,6 +294,31 @@ add/remove churn, and between removals the address was self-captured into the
 tunnel — the exact failure the bypass exists to prevent. A bypass route only
 pins one peer's underlay address (the server's transport address) off the
 tunnel, so keeping a no-longer-listed one for the session is harmless.
+
+**Application is best-effort and per-address, not a transaction.**
+`BypassRouteManager::update` adds each required address independently: a
+committed bypass is kept, and a failure to add one address is logged and skipped
+rather than aborting the rest. The required set is the full resolved relay map
+(both address families) plus the live direct path(s), so a single address that
+transiently cannot be pinned — e.g. a relay whose per-IP route is briefly a
+gateway-less cloned entry during startup — must not block pinning the endpoint
+iroh actually selected. In a full tunnel an aborted batch would leave the live
+transport captured into the tunnel and stall the connection.
+
+**Gateway resolution falls back to the captured default gateway.** A bypass must
+be pinned to a real next-hop gateway; a gateway-less (link-scope) host route
+would black-hole the address. When the freshly queried per-IP route either
+resolves through the VPN tunnel itself (a direct path discovered *after* the VPN
+routes went up) or resolves via a physical interface but yields no next-hop
+gateway (a transient cloned-route state), `ezvpn` re-pins via the underlay
+default gateway captured while the routing table was still pristine
+(`resolve_bypass_route_info` in `net/device.rs`). Only if no usable captured
+gateway exists is the bypass refused.
+
+Both the best-effort application and the gateway fallback live in the
+cross-platform layer (`update` and `resolve_bypass_route_info`); the
+per-platform code (`add_bypass_route_impl`) only issues the single host-route
+add, so the behavior is identical on Linux, macOS, and Windows.
 
 Only the addresses iroh actually uses for transport are ever bypassed: the
 manager's required set comes from `collect_addresses_from_paths`, i.e. the
