@@ -1237,10 +1237,13 @@ impl VpnServer {
                                 .packets_dropped_too_large
                                 .fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(_) => {
-                            datagram_stats
-                                .packets_dropped_full
-                                .fetch_add(1, Ordering::Relaxed);
+                        Err(e) => {
+                            // Connection lost or datagrams disabled/unsupported:
+                            // terminal for this client's datagram path, not queue
+                            // pressure (`packets_dropped_full` counts only the
+                            // bounded per-client queue overflowing). Connection
+                            // cleanup accounts for the client.
+                            log::debug!("client datagram writer stopping: {e}");
                             break 'writer;
                         }
                     }

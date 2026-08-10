@@ -103,10 +103,18 @@ pub const QUIC_DATAGRAM_SEND_BUFFER_SIZE: usize = 256 * 1024;
 /// tunnel runs at >100k packets/s; the default threshold of 1 (ACK every other
 /// packet) makes ACK generation and processing a first-order CPU cost on both
 /// endpoints. 15 (one ACK per 16 packets) cuts that cost by ~8x while staying
-/// small next to the congestion window on any path this VPN targets. Loss
-/// recovery is unaffected: the inner flow owns retransmission, and reordered
-/// packets still elicit an immediate ACK via the reordering threshold.
+/// small next to the congestion window on any path this VPN targets.
 pub const QUIC_ACK_ELICITING_THRESHOLD: u32 = 15;
+
+/// Number of out-of-order ack-eliciting packets that trigger an immediate ACK
+/// from the peer, bypassing [`QUIC_ACK_ELICITING_THRESHOLD`].
+///
+/// Pinned to 1 — the behavior QUIC has without the ACK Frequency extension —
+/// so any reordered packet is acknowledged immediately and the sender detects
+/// loss (and Cubic reacts to it) as promptly as with per-packet ACKs. The
+/// noq default of 2 would delay that signal by a packet; only in-order bulk
+/// flow is meant to benefit from the reduced ACK rate.
+pub const QUIC_ACK_REORDERING_THRESHOLD: u32 = 1;
 
 /// Build the fixed QUIC transport config used by both client and server.
 ///
@@ -148,11 +156,13 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     // ACK frequency extension: the data path is one QUIC packet per IP packet,
     // so at high rates the default ACK-every-other-packet makes ACK generation
     // and processing a first-order CPU cost on both endpoints. Request an ACK
-    // per QUIC_ACK_ELICITING_THRESHOLD ack-eliciting packets instead; loss
-    // detection still triggers promptly via the reordering threshold. Both
-    // sides run the same build, so the extension always negotiates.
+    // per QUIC_ACK_ELICITING_THRESHOLD ack-eliciting packets instead, with
+    // the reordering threshold pinned to 1 so out-of-order packets are still
+    // ACKed immediately (see the constants for rationale). Both sides run the
+    // same build, so the extension always negotiates.
     let mut ack_frequency = AckFrequencyConfig::default();
     ack_frequency.ack_eliciting_threshold(VarInt::from_u32(QUIC_ACK_ELICITING_THRESHOLD));
+    ack_frequency.reordering_threshold(VarInt::from_u32(QUIC_ACK_REORDERING_THRESHOLD));
     transport_config = transport_config.ack_frequency_config(Some(ack_frequency));
 
     // The data path maps each IP packet to one unreliable QUIC datagram, so
