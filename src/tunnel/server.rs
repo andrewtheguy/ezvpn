@@ -1211,26 +1211,38 @@ impl VpnServer {
         // awaitable datagram API, so QUIC congestion applies backpressure here
         // without allowing one slow client to block the server TUN reader.
         let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(CLIENT_CHANNEL_SIZE);
+        crate::transport::paths::spawn_path_stats_logger(connection.clone(), "server");
         let datagram_conn = connection.clone();
         let datagram_stats = self.stats.clone();
         let datagram_writer_handle = tokio::spawn(async move {
-            while let Some(datagram) = datagram_rx.recv().await {
-                match datagram_conn.send_datagram_wait(datagram).await {
-                    Ok(()) => {
-                        datagram_stats
-                            .packets_to_clients
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(iroh::endpoint::SendDatagramError::TooLarge) => {
-                        datagram_stats
-                            .packets_dropped_too_large
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(_) => {
-                        datagram_stats
-                            .packets_dropped_full
-                            .fetch_add(1, Ordering::Relaxed);
-                        break;
+            // Drain the queue in batches to amortize channel wakeups; each
+            // datagram still goes through the send-buffer-aware fast path so
+            // QUIC backpressure applies per datagram.
+            let mut batch: Vec<Bytes> = Vec::with_capacity(WRITE_BATCH_SIZE);
+            'writer: loop {
+                let count = datagram_rx.recv_many(&mut batch, WRITE_BATCH_SIZE).await;
+                if count == 0 {
+                    break;
+                }
+                for datagram in batch.drain(..) {
+                    match crate::tunnel::stream::send_one_datagram(&datagram_conn, datagram).await
+                    {
+                        Ok(()) => {
+                            datagram_stats
+                                .packets_to_clients
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(iroh::endpoint::SendDatagramError::TooLarge) => {
+                            datagram_stats
+                                .packets_dropped_too_large
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            datagram_stats
+                                .packets_dropped_full
+                                .fetch_add(1, Ordering::Relaxed);
+                            break 'writer;
+                        }
                     }
                 }
             }

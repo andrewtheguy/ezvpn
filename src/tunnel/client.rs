@@ -893,6 +893,7 @@ pub(crate) async fn run_tunnel(
     // bypass guard stays armed across it; once the split succeeds we disarm it
     // into a bare handle that the cleanup path below aborts when the VPN ends.
     let (mut tun_reader, mut tun_writer) = tun_device.split()?;
+    crate::transport::paths::spawn_path_stats_logger(connection.clone(), "client");
     let bypass_route_task = bypass_route_guard.map(AbortOnDropTask::disarm);
     let local_gso_enabled = tun_reader.offload_status().enabled;
     debug_assert_eq!(local_gso_enabled, tun_writer.offload_status().enabled);
