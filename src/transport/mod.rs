@@ -8,8 +8,8 @@ pub mod endpoint;
 pub mod paths;
 
 use anyhow::{Context, Result};
-use iroh::endpoint::QuicTransportConfig;
-use noq_proto::congestion::Bbr3Config;
+use iroh::endpoint::{AckFrequencyConfig, QuicTransportConfig, VarInt};
+use noq_proto::congestion::CubicConfig;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,9 +96,29 @@ pub const QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 /// while applying backpressure before latency and loss multiply.
 pub const QUIC_DATAGRAM_SEND_BUFFER_SIZE: usize = 256 * 1024;
 
+/// Number of ack-eliciting packets the peer may receive before it must send an
+/// ACK (QUIC ACK Frequency extension).
+///
+/// Each tunneled IP packet is one QUIC packet, so a bulk TCP flow through the
+/// tunnel runs at >100k packets/s; the default threshold of 1 (ACK every other
+/// packet) makes ACK generation and processing a first-order CPU cost on both
+/// endpoints. 15 (one ACK per 16 packets) cuts that cost by ~8x while staying
+/// small next to the congestion window on any path this VPN targets.
+pub const QUIC_ACK_ELICITING_THRESHOLD: u32 = 15;
+
+/// Number of out-of-order ack-eliciting packets that trigger an immediate ACK
+/// from the peer, bypassing [`QUIC_ACK_ELICITING_THRESHOLD`].
+///
+/// Pinned to 1 — the behavior QUIC has without the ACK Frequency extension —
+/// so any reordered packet is acknowledged immediately and the sender detects
+/// loss (and Cubic reacts to it) as promptly as with per-packet ACKs. The
+/// noq default of 2 would delay that signal by a packet; only in-order bulk
+/// flow is meant to benefit from the reduced ACK rate.
+pub const QUIC_ACK_REORDERING_THRESHOLD: u32 = 1;
+
 /// Build the fixed QUIC transport config used by both client and server.
 ///
-/// Every setting is a constant: BBRv3 congestion control, 8 MB windows, the
+/// Every setting is a constant: Cubic congestion control, 8 MB windows, the
 /// keep-alive/idle timers above, and the protocol-minimum initial MTU. Both
 /// sides applying the identical config means nothing has to be negotiated.
 pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
@@ -111,12 +131,17 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     transport_config = transport_config.max_idle_timeout(Some(idle_timeout));
     transport_config = transport_config.keep_alive_interval(QUIC_KEEP_ALIVE_INTERVAL);
 
-    // BBRv3 uses a bandwidth/RTT model and explicitly paces transmissions. That
-    // is important for a VPN carrying TCP inside QUIC DATAGRAMs: CUBIC reacts
-    // to the same loss as the inner TCP connection, multiplying congestion-window
-    // reductions, while bursty sends overflow small platform UDP socket queues.
+    // Cubic congestion control. BBRv3 was tried first (its pacing model is
+    // attractive for TCP-in-datagram tunnels), but noq's implementation
+    // collapses to its minimum congestion window after a burst-loss episode and
+    // never recovers — measured on an uncapped LAN path: the server→client
+    // direction dropped from >1 Gbit/s to ~100 Mbit/s for the remaining
+    // lifetime of the connection (cwnd pinned at min_pipe_cwnd with a poisoned
+    // max_bw estimate). Cubic recovers from the same loss bursts within RTTs
+    // and sustains ~40% more throughput even before any loss. Revisit if noq's
+    // BBRv3 gains a working loss-recovery path.
     transport_config =
-        transport_config.congestion_controller_factory(Arc::new(Bbr3Config::default()));
+        transport_config.congestion_controller_factory(Arc::new(CubicConfig::default()));
 
     // Fixed flow-control windows for connection + streams.
     transport_config = transport_config.receive_window(QUIC_WINDOW_SIZE.into());
@@ -127,6 +152,18 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     // Discovery config and min_mtu keep their defaults, including downward
     // black-hole recovery for smaller paths.
     transport_config = transport_config.initial_mtu(QUIC_INITIAL_MTU);
+
+    // ACK frequency extension: the data path is one QUIC packet per IP packet,
+    // so at high rates the default ACK-every-other-packet makes ACK generation
+    // and processing a first-order CPU cost on both endpoints. Request an ACK
+    // per QUIC_ACK_ELICITING_THRESHOLD ack-eliciting packets instead, with
+    // the reordering threshold pinned to 1 so out-of-order packets are still
+    // ACKed immediately (see the constants for rationale). Both sides run the
+    // same build, so the extension always negotiates.
+    let mut ack_frequency = AckFrequencyConfig::default();
+    ack_frequency.ack_eliciting_threshold(VarInt::from_u32(QUIC_ACK_ELICITING_THRESHOLD));
+    ack_frequency.reordering_threshold(VarInt::from_u32(QUIC_ACK_REORDERING_THRESHOLD));
+    transport_config = transport_config.ack_frequency_config(Some(ack_frequency));
 
     // The data path maps each IP packet to one unreliable QUIC datagram, so
     // datagrams must be enabled in both directions (a `None` receive buffer

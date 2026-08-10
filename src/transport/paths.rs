@@ -16,6 +16,41 @@ use tokio::task::JoinHandle;
 /// on-demand status call stays responsive even when a relay is unreachable.
 const HEALTHZ_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Diagnostic-only: while the `EZVPN_PATH_STATS` env var is set, periodically
+/// log each path's congestion stats (cwnd, loss, congestion-controller state).
+/// Off the hot path; a no-op unless the env var is present at spawn time.
+pub fn spawn_path_stats_logger(conn: Connection, label: &'static str) {
+    if std::env::var_os("EZVPN_PATH_STATS").is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        let closed = conn.closed();
+        tokio::pin!(closed);
+        loop {
+            tokio::select! {
+                _ = &mut closed => return,
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
+            for path in conn.paths().iter() {
+                let stats = path.stats();
+                let cong = conn.congestion_state(path.id());
+                log::info!(
+                    "[pathstats {}] {:?} sel={} rtt={:?} cwnd={} cong_events={} lost={} mtu={} state={:?}",
+                    label,
+                    path.remote_addr(),
+                    path.is_selected(),
+                    stats.rtt,
+                    stats.cwnd,
+                    stats.congestion_events,
+                    stats.lost_packets,
+                    stats.current_mtu,
+                    cong,
+                );
+            }
+        }
+    });
+}
+
 /// Format connection path info for display, showing *all* paths with RTT and
 /// marking which is selected.
 ///

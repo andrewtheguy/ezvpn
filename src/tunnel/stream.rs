@@ -106,13 +106,34 @@ pub async fn send_ip_datagrams(
         &mut outcome,
     );
     for datagram in pending.drain(..) {
-        match conn.send_datagram_wait(datagram).await {
+        match send_one_datagram(conn, datagram).await {
             Ok(()) => outcome.sent += 1,
             Err(SendDatagramError::TooLarge) => outcome.dropped_too_large += 1,
             Err(_) => outcome.dropped_other += 1,
         }
     }
     outcome
+}
+
+/// Send one prepared datagram, taking the non-waiting path when the bounded
+/// send buffer has room and awaiting `send_datagram_wait` only under
+/// backpressure.
+///
+/// `datagram_send_buffer_space()` guarantees a fitting non-waiting send cannot
+/// evict older queued datagrams, and each connection has exactly one
+/// datagram-producing task (the client TUN reader / the server's per-client
+/// writer), so the check cannot race with another producer. This keeps the
+/// backpressure semantics while skipping the wait-future setup per datagram on
+/// the uncongested hot path.
+pub(crate) async fn send_one_datagram(
+    conn: &Connection,
+    datagram: Bytes,
+) -> Result<(), SendDatagramError> {
+    if conn.datagram_send_buffer_space() >= datagram.len() {
+        conn.send_datagram(datagram)
+    } else {
+        conn.send_datagram_wait(datagram).await
+    }
 }
 
 /// Materialize a TUN packet into plain datagrams without sending them.
