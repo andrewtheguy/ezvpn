@@ -50,12 +50,11 @@ use rand::RngExt;
 use crate::config::VPN_MTU;
 use crate::error::{VpnError, VpnResult};
 use crate::net::device::TunDevice;
-use crate::transport::endpoint::{RelayConfig, create_client_endpoint};
+use crate::transport::endpoint::{RelayConfig, connect_with_timeout, create_client_endpoint};
 use crate::tunnel::client::{
     ServerInfo, collect_local_iroh_udp_ports, collect_relay_ips, overlapping_underlay_excludes,
     perform_handshake, run_tunnel,
 };
-use crate::tunnel::signaling::VPN_ALPN;
 
 /// Connection parameters supplied by the iOS app (built from the FFI JSON).
 #[derive(Debug, Clone, Default)]
@@ -140,10 +139,7 @@ impl IosSession {
             addr = addr.with_relay_url(url.clone());
         }
 
-        let connection = endpoint
-            .connect(addr, VPN_ALPN)
-            .await
-            .map_err(|e| VpnError::Signaling(format!("Failed to connect to server: {e}")))?;
+        let connection = connect_with_timeout(&endpoint, addr).await?;
 
         // Random per-session id, like the desktop client. The server keys IP
         // allocation by (endpoint id, device id).

@@ -33,10 +33,10 @@ use crate::tunnel::offload::VirtioNetHdr;
 use crate::transport::paths::watch_connection_paths;
 use crate::config::VPN_MTU;
 use crate::tunnel::signaling::{
-    MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VPN_ALPN, VpnHandshake, VpnHandshakeResponse, read_message,
+    MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse, read_message,
     write_message,
 };
-use crate::transport::endpoint::RelayConfig;
+use crate::transport::endpoint::{connect_with_timeout, RelayConfig};
 use bytes::{Bytes, BytesMut};
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -314,10 +314,7 @@ impl VpnClient {
 
         // Client and server both build the identical fixed transport config
         // (see crate::transport), so nothing is negotiated or upgraded here.
-        let connection = endpoint
-            .connect(endpoint_addr, VPN_ALPN)
-            .await
-            .map_err(|e| VpnError::Signaling(format!("Failed to connect to server: {}", e)))?;
+        let connection = connect_with_timeout(endpoint, endpoint_addr).await?;
 
         log::info!("Connected to server, performing handshake...");
 

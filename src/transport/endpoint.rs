@@ -1,14 +1,15 @@
 //! Common endpoint helpers for iroh tunnel connections.
 
+use crate::error::{VpnError, VpnResult};
 use crate::transport::build_quic_transport_config;
 use crate::tunnel::signaling::VPN_ALPN;
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use futures::future::join_all;
 use iroh::{
-    Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
     address_lookup::{DnsAddressLookup, PkarrPublisher},
-    endpoint::{Builder as EndpointBuilder, presets},
+    endpoint::{Builder as EndpointBuilder, Connection, presets},
 };
 use log::info;
 use std::path::Path;
@@ -16,6 +17,37 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline for establishing the QUIC connection to the VPN server.
+///
+/// `Endpoint::connect` has no deadline of its own: when no path to the server is
+/// reachable — or the underlying socket is wedged after a network change — that
+/// future can pend forever, which would hang the CLI on first connect and stall
+/// the reconnect loop permanently instead of retrying. Bounding it turns that
+/// wedge into a normal recoverable `Signaling` error, so the reconnect loop backs
+/// off and tries again (which also nudges the endpoint to rebind).
+///
+/// Generous: a healthy connect through address lookup + relay completes well
+/// within this.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Connect to `addr` over [`VPN_ALPN`], bounded by [`CONNECT_TIMEOUT`].
+///
+/// Both the timeout and the underlying connect error map to
+/// [`VpnError::Signaling`], which `is_recoverable()` treats as transient, so a
+/// failure here feeds the client's reconnect loop rather than killing it. Shared
+/// by the desktop/CLI client and the iOS session.
+pub async fn connect_with_timeout(endpoint: &Endpoint, addr: EndpointAddr) -> VpnResult<Connection> {
+    tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, VPN_ALPN))
+        .await
+        .map_err(|_| {
+            VpnError::Signaling(format!(
+                "Timed out connecting to server after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|e| VpnError::Signaling(format!("Failed to connect to server: {e}")))
+}
 
 /// Relay configuration, resolved once from the raw config strings.
 ///
@@ -25,8 +57,10 @@ pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// stack (pkarr publishing + DNS resolution of the peer's home relay — see
 /// <https://docs.iroh.computer/concepts/address-lookup>), while
 /// [`Custom`](Self::Custom) uses the configured relays with internet discovery
-/// disabled (clients reach the server through relay hints instead). See "Relays
-/// and Address Lookup" in `docs/Architecture.md`.
+/// disabled (clients reach the server through relay hints instead). The full
+/// design — shared with tunnel-rs and flextunnel — is documented in
+/// <https://github.com/flexaccessdev/iroh-common-architecture> (see
+/// `relays-and-address-lookup.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RelayConfig {
     /// iroh's default relay map, with n0 address lookup.
