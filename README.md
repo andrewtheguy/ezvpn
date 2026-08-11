@@ -671,25 +671,36 @@ restart or allocation state changes.
 
 ## Relay and Address Lookup
 
-`ezvpn` can use custom iroh relay infrastructure:
+The relay and address-lookup design is shared with
+[tunnel-rs](https://github.com/andrewtheguy/tunnel-rs) and
+[flextunnel](https://github.com/flexaccessdev/flextunnel), and is documented once
+in
+**[iroh-common-architecture](https://github.com/flexaccessdev/iroh-common-architecture)** —
+see [relays and address lookup](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relays-and-address-lookup.md)
+for the design and [self-hosting](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/self-hosting.md)
+for running your own relay.
 
-- `relay_urls` / `--relay-url` configure custom relay servers. This only
-  changes which relay map iroh uses for the transport path; the server still
-  uses a single endpoint and its usual relay failover.
-- [iroh address lookup](https://docs.iroh.computer/concepts/address-lookup)
-  (pkarr publishing + DNS-based lookup via n0's `dns.iroh.link`) is always
-  used — for both the default relays and custom relays — so a client resolves
-  the server's current home relay by endpoint ID. It is not configurable.
-  This is iroh's endpoint-ID resolution, not real/VPN DNS: it does not affect
-  client DNS resolution, and the client does not push DNS or match domains
-  over the tunnel. To resolve an internal zone through a resolver reachable
-  over the tunnel, set OS-level conditional forwarding — see
-  [docs/Client-Split-DNS.md](docs/Client-Split-DNS.md).
-- With custom relays, the client also attaches its configured relay URLs to
-  the connection as dial hints. That is only an optimization on top of address
-  lookup (it lets iroh start relay routing before the lookup completes); the
-  connection does not depend on it. See "Relays and Address Lookup" in
-  [docs/Architecture.md](docs/Architecture.md) for the full design rationale.
+The short version as it applies to `ezvpn`:
+
+- `relay_urls` / `--relay-url` select custom relay servers. That single choice
+  also decides whether [iroh address
+  lookup](https://docs.iroh.computer/concepts/address-lookup) (n0 pkarr publish +
+  DNS via `dns.iroh.link`) runs: **on** with the default relays, **off** with
+  custom relays. It is not separately configurable.
+- With custom relays, the client reaches the server through the relay URLs it
+  attaches to the connection as dial hints. These are **required** for
+  connectivity in that mode — with lookup off there is no published record to
+  fall back on — so configure both sides with the full relay list.
+- Every configured custom relay is probed individually at startup and **all**
+  must come online, so a dead backup relay fails startup instead of hiding until
+  you need it. `relay_auth_token` (custom relays only) is validated by the same
+  probe.
+
+iroh address lookup is endpoint-ID resolution, not real/VPN DNS: it does not
+affect client DNS resolution, and the client does not push DNS or match domains
+over the tunnel. To resolve an internal zone through a resolver reachable over
+the tunnel, set OS-level conditional forwarding — see
+[docs/Client-Split-DNS.md](docs/Client-Split-DNS.md).
 
 See the relay comments in `vpn_server.toml.example` and
 `vpn_client.toml.example` for exact TOML syntax.

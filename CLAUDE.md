@@ -7,3 +7,9 @@ Architecture and design notes live in `docs/Architecture.md`. In particular, see
 "Client Isolation" (mandatory server-side client-to-client drop) and "Client
 Network Consistency Check (Reconnect)" (how the client handles a reassigned IP vs
 other server param changes on reconnect).
+
+The iroh transport layer shared with tunnel-rs and flextunnel — relays and
+address lookup, the per-relay startup probe, relay auth tokens, relay
+self-hosting — is documented once in
+https://github.com/flexaccessdev/iroh-common-architecture. Do not duplicate it in
+this repo; update it there and link to it.
