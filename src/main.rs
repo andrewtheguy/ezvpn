@@ -25,6 +25,9 @@ use ezvpn::config::file_config::{
 };
 use ezvpn::runtime::LockRole;
 use ezvpn::transport::endpoint::{create_client_endpoint, create_server_endpoint, load_secret};
+use ezvpn::transport::{
+    CongestionConfig, CongestionControl, parse_congestion_initial_window, set_congestion_config,
+};
 // Runtime config types (different from the TOML config types in config::file_config)
 use ezvpn::config::{VpnClientConfig, VpnServerConfig};
 use ezvpn::tunnel::{VpnClient, VpnServer};
@@ -99,6 +102,38 @@ enum Command {
     },
 }
 
+/// Congestion-control knobs shared by `server start` and `client start`.
+///
+/// Deliberately CLI-only — never config-file settings — so a controller or
+/// initial window can be measured on a real path without a rebuild. Both are
+/// sender-local and unnegotiated, so client and server may differ.
+#[derive(Clone, Copy, clap::Args)]
+#[command(next_help_heading = "Congestion control (testing knobs, CLI-only)")]
+struct CongestionArgs {
+    /// QUIC congestion controller for this process.
+    ///
+    /// Sender-local and unnegotiated: client and server may run different
+    /// controllers, which is useful for isolating one direction.
+    #[arg(long, value_enum, default_value_t = CongestionControl::default())]
+    congestion_control: CongestionControl,
+
+    /// Initial congestion window in bytes.
+    ///
+    /// Applies to whichever controller is selected. Defaults to that
+    /// controller's own initial window (12000).
+    #[arg(long, value_name = "BYTES", value_parser = parse_congestion_initial_window)]
+    congestion_initial_window: Option<u64>,
+}
+
+impl CongestionArgs {
+    fn config(self) -> CongestionConfig {
+        CongestionConfig {
+            control: self.congestion_control,
+            initial_window: self.congestion_initial_window,
+        }
+    }
+}
+
 /// Server subcommands.
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
@@ -119,6 +154,9 @@ enum ServerAction {
         /// /usr/local/etc/ezvpn on macOS, %ProgramData%\ezvpn on Windows)
         #[arg(long)]
         default_config: bool,
+
+        #[command(flatten)]
+        congestion: CongestionArgs,
     },
     /// Query the status of the running VPN server on this host.
     Status {
@@ -207,6 +245,9 @@ enum ClientAction {
         /// (EZVPN_LOG_MAX_BYTES) with one rotated <name>.log.1 backup.
         #[arg(long)]
         daemon: bool,
+
+        #[command(flatten)]
+        congestion: CongestionArgs,
     },
     /// Stop a running VPN client on Unix (sends SIGTERM for a graceful shutdown).
     Stop {
@@ -330,6 +371,7 @@ fn main() -> Result<()> {
                     max_reconnect_attempts,
                     instance,
                     daemon,
+                    congestion,
                 },
         } => {
             runtime::validate_instance_name(&instance)?;
@@ -363,6 +405,9 @@ fn main() -> Result<()> {
 
             init_logger();
             log_version();
+            // Before any endpoint exists, so the choice is latched for every
+            // transport config this process builds (including reconnects).
+            set_congestion_config(congestion.config());
             build_runtime()?.block_on(run_vpn_client(resolved, &instance, daemon_log))
         }
 
@@ -407,9 +452,13 @@ async fn run_async(command: Command) -> Result<()> {
                 ServerAction::Start {
                     config,
                     default_config,
+                    congestion,
                 },
         } => {
             log_version();
+            // Before any endpoint exists, so the choice is latched for every
+            // transport config this process builds.
+            set_congestion_config(congestion.config());
             // Config file is required for VPN server
             if config.is_none() && !default_config {
                 anyhow::bail!(
