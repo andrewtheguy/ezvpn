@@ -246,7 +246,7 @@ impl fmt::Display for CongestionConfig {
 /// testing-only setting into every embedder's API.
 static CONGESTION_CONFIG: OnceLock<CongestionConfig> = OnceLock::new();
 
-/// Override the congestion-control settings for this process. Call once at
+/// Set and log the congestion-control settings for this process. Call once at
 /// startup from the CLI, before any endpoint is created — the value is latched
 /// on first use and a later call is ignored with a warning.
 pub fn set_congestion_config(config: CongestionConfig) {
@@ -255,8 +255,8 @@ pub fn set_congestion_config(config: CongestionConfig) {
             "congestion control already fixed to {}; ignoring override {config}",
             congestion_config()
         );
-    } else if config != CongestionConfig::default() {
-        log::info!("Congestion control overridden: {config}");
+    } else {
+        log::info!("QUIC congestion controller: {config}");
     }
 }
 

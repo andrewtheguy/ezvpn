@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "ezvpn"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "anyhow",
  "base64",
@@ -1610,8 +1610,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "460de6bc52163b41b1646931f2897e5ab986f0966ade444467fec25024751a72"
+source = "git+https://github.com/andrewtheguy/iroh.git?branch=ezvpn-send-backpressure-1.0.3#df40a97deb8f765dc990df9fd534414650e1f433"
 dependencies = [
  "backon",
  "blake3",
@@ -1661,8 +1660,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6be73e16ee21c923aca9b3121aaa0db936f7c7ecc156ff47b8dac944c68d59a8"
+source = "git+https://github.com/andrewtheguy/iroh.git?branch=ezvpn-send-backpressure-1.0.3#df40a97deb8f765dc990df9fd534414650e1f433"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1680,8 +1678,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46f6a9b39d18e6345f5c151afd299f2488e2cb5c520fe41b107b6bd3dc4c3349"
+source = "git+https://github.com/andrewtheguy/iroh.git?branch=ezvpn-send-backpressure-1.0.3#df40a97deb8f765dc990df9fd534414650e1f433"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -1731,8 +1728,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24bd586cf927f7b700f56ec3639b53cb5fa901ce284784051ff71092bfbf8193"
+source = "git+https://github.com/andrewtheguy/iroh.git?branch=ezvpn-send-backpressure-1.0.3#df40a97deb8f765dc990df9fd534414650e1f433"
 dependencies = [
  "blake3",
  "bytes",
