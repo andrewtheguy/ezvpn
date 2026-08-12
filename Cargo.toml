@@ -25,7 +25,10 @@ env_logger = "0.11"
 etherparse = "0.20"
 futures = "0.3"
 ipnet = { version = "2", features = ["serde"] }
-iroh = "1.0.3"
+# Forked from iroh v1.0.3. This branch preserves established-path transport
+# backpressure so noq retains and retries the transmit instead of treating a
+# local discard as successful. Cargo.lock pins the tested branch commit.
+iroh = { version = "=1.0.3", git = "https://github.com/andrewtheguy/iroh.git", branch = "ezvpn-send-backpressure-1.0.3" }
 noq-proto = "1.1.0"
 n0-watcher = "1.0.0"
 log = "0.4"
