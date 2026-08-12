@@ -3,14 +3,23 @@
 //! All transport settings are fixed constants, WireGuard/Tailscale-style:
 //! there are no tuning knobs, nothing is negotiated, and both sides build the
 //! identical config from [`build_quic_transport_config`].
+//!
+//! The single exception is congestion control, which the CLI can override with
+//! `--congestion-control` and `--congestion-initial-window` (see
+//! [`CongestionConfig`] and [`set_congestion_config`]). It exists so a different
+//! controller or a different initial window can be benchmarked without
+//! rebuilding, is *not* readable from a config file, and is not part of the
+//! protocol: each side picks its own sender-side controller, so nothing has to
+//! match across the tunnel.
 
 pub mod endpoint;
 pub mod paths;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{AckFrequencyConfig, QuicTransportConfig, VarInt};
-use noq_proto::congestion::Bbr3Config;
-use std::sync::Arc;
+use noq_proto::congestion::{Bbr3Config, ControllerFactory, CubicConfig, NewRenoConfig};
+use std::fmt;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// QUIC keep-alive interval for tunnel connections.
@@ -116,11 +125,154 @@ pub const QUIC_ACK_ELICITING_THRESHOLD: u32 = 15;
 /// flow is meant to benefit from the reduced ACK rate.
 pub const QUIC_ACK_REORDERING_THRESHOLD: u32 = 1;
 
+/// Congestion controller for the QUIC tunnel connection.
+///
+/// [`CongestionControl::Bbr3`] is the default and what production runs; the
+/// other variants exist so alternatives can be measured on a real path without
+/// recompiling. The controller only governs the local sender, so the two ends
+/// of a tunnel may run different ones.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum CongestionControl {
+    /// Paced BBRv3: what production runs (rationale in
+    /// `build_quic_transport_config`).
+    #[default]
+    Bbr3,
+    /// Loss-based CUBIC, the common TCP/QUIC default elsewhere.
+    Cubic,
+    /// Loss-based NewReno, the RFC 9002 reference controller.
+    NewReno,
+}
+
+impl fmt::Display for CongestionControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Bbr3 => "bbr3",
+            Self::Cubic => "cubic",
+            Self::NewReno => "new-reno",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Smallest accepted `--congestion-initial-window`: two initial-MTU packets,
+/// the floor RFC 9002 gives for the initial congestion window. Below this the
+/// sender cannot even keep two packets in flight.
+pub const CONGESTION_INITIAL_WINDOW_MIN: u64 = 2 * QUIC_INITIAL_MTU as u64;
+
+/// Largest accepted `--congestion-initial-window`. Beyond the flow-control
+/// window ([`QUIC_WINDOW_SIZE`]) the congestion window is no longer what limits
+/// the sender, so a larger value would silently do nothing.
+pub const CONGESTION_INITIAL_WINDOW_MAX: u64 = QUIC_WINDOW_SIZE as u64;
+
+/// clap value parser for `--congestion-initial-window` (bytes).
+///
+/// Bounds live here rather than in the CLI so the accepted range stays tied to
+/// the transport constants it is derived from. noq applies the value verbatim —
+/// it neither clamps nor sanity-checks — so the range is enforced up front.
+pub fn parse_congestion_initial_window(raw: &str) -> Result<u64, String> {
+    let bytes: u64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a byte count"))?;
+    if !(CONGESTION_INITIAL_WINDOW_MIN..=CONGESTION_INITIAL_WINDOW_MAX).contains(&bytes) {
+        return Err(format!(
+            "must be between {CONGESTION_INITIAL_WINDOW_MIN} and \
+             {CONGESTION_INITIAL_WINDOW_MAX} bytes (got {bytes})"
+        ));
+    }
+    Ok(bytes)
+}
+
+/// The congestion-control settings the CLI may override, defaulting to what
+/// production runs (paced BBRv3 with noq's stock initial window).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CongestionConfig {
+    /// Which controller drives the local sender.
+    pub control: CongestionControl,
+    /// Initial congestion window in bytes, or `None` for the controller's
+    /// stock value (noq: 14720 clamped to 2–10 base datagrams, i.e. 12000).
+    /// Validated by [`parse_congestion_initial_window`].
+    pub initial_window: Option<u64>,
+}
+
+impl CongestionConfig {
+    /// The noq controller factory for these settings. Only the algorithm and
+    /// its initial window are selectable; every other controller parameter
+    /// keeps its noq default.
+    fn factory(self) -> Arc<dyn ControllerFactory + Send + Sync + 'static> {
+        // Each config type has its own `initial_window` setter with no shared
+        // trait, so the arms differ only in which one they build.
+        match self.control {
+            CongestionControl::Bbr3 => {
+                let mut config = Bbr3Config::default();
+                if let Some(window) = self.initial_window {
+                    config.initial_window(window);
+                }
+                Arc::new(config)
+            }
+            CongestionControl::Cubic => {
+                let mut config = CubicConfig::default();
+                if let Some(window) = self.initial_window {
+                    config.initial_window(window);
+                }
+                Arc::new(config)
+            }
+            CongestionControl::NewReno => {
+                let mut config = NewRenoConfig::default();
+                if let Some(window) = self.initial_window {
+                    config.initial_window(window);
+                }
+                Arc::new(config)
+            }
+        }
+    }
+}
+
+impl fmt::Display for CongestionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.control)?;
+        match self.initial_window {
+            Some(window) => write!(f, " (initial window {window} bytes)"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Process-wide congestion-control settings, settable once by the CLI.
+///
+/// A global rather than a parameter because [`build_quic_transport_config`] is
+/// also reached from the FFI entry points (iOS/Windows) and the relay probe,
+/// none of which parse CLI arguments; threading a knob through them would put a
+/// testing-only setting into every embedder's API.
+static CONGESTION_CONFIG: OnceLock<CongestionConfig> = OnceLock::new();
+
+/// Override the congestion-control settings for this process. Call once at
+/// startup from the CLI, before any endpoint is created — the value is latched
+/// on first use and a later call is ignored with a warning.
+pub fn set_congestion_config(config: CongestionConfig) {
+    if CONGESTION_CONFIG.set(config).is_err() {
+        log::warn!(
+            "congestion control already fixed to {}; ignoring override {config}",
+            congestion_config()
+        );
+    } else if config != CongestionConfig::default() {
+        log::info!("Congestion control overridden: {config}");
+    }
+}
+
+/// The congestion-control settings in effect, latching the defaults on first use.
+pub fn congestion_config() -> CongestionConfig {
+    *CONGESTION_CONFIG.get_or_init(CongestionConfig::default)
+}
+
 /// Build the fixed QUIC transport config used by both client and server.
 ///
 /// Every setting is a constant: BBRv3 congestion control, 8 MB windows, the
 /// keep-alive/idle timers above, and the protocol-minimum initial MTU. Both
-/// sides applying the identical config means nothing has to be negotiated.
+/// sides applying the identical config means nothing has to be negotiated. The
+/// congestion controller is the one setting the CLI can change (see
+/// [`set_congestion_config`]); it is sender-local, so it stays outside the
+/// protocol even when the two ends differ.
 pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     // Configure transport with keep-alive and idle timeout.
     // See QUIC_KEEP_ALIVE_INTERVAL and QUIC_IDLE_TIMEOUT constants for rationale.
@@ -135,8 +287,10 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     // is important for a VPN carrying TCP inside QUIC DATAGRAMs: Cubic reacts
     // to the same loss as the inner TCP connection, multiplying congestion-window
     // reductions, while bursty sends overflow small platform UDP socket queues.
+    // `--congestion-control` / `--congestion-initial-window` can change this
+    // for measurement.
     transport_config =
-        transport_config.congestion_controller_factory(Arc::new(Bbr3Config::default()));
+        transport_config.congestion_controller_factory(congestion_config().factory());
 
     // Fixed flow-control windows for connection + streams.
     transport_config = transport_config.receive_window(QUIC_WINDOW_SIZE.into());
@@ -169,4 +323,74 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
         transport_config.datagram_send_buffer_size(QUIC_DATAGRAM_SEND_BUFFER_SIZE);
 
     Ok(transport_config.build())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::ValueEnum;
+
+    // The CLI accepts exactly the names `Display` prints, so a value copied out
+    // of a log line can be pasted back into `--congestion-control`.
+    #[test]
+    fn congestion_control_names_round_trip() {
+        for choice in CongestionControl::value_variants() {
+            let name = choice.to_string();
+            assert_eq!(
+                CongestionControl::from_str(&name, true).expect("parses its own name"),
+                *choice
+            );
+        }
+    }
+
+    #[test]
+    fn congestion_config_defaults_to_stock_bbr3() {
+        let config = CongestionConfig::default();
+        assert_eq!(config.control, CongestionControl::Bbr3);
+        assert_eq!(config.initial_window, None);
+        assert_eq!(config.to_string(), "bbr3");
+    }
+
+    #[test]
+    fn congestion_config_displays_initial_window_override() {
+        let config = CongestionConfig {
+            control: CongestionControl::Cubic,
+            initial_window: Some(30_000),
+        };
+        assert_eq!(config.to_string(), "cubic (initial window 30000 bytes)");
+    }
+
+    // noq applies the initial window verbatim, so the CLI is the only place a
+    // useless value (too small to keep two packets in flight, or above the
+    // flow-control window) can be caught.
+    #[test]
+    fn initial_window_parser_enforces_bounds() {
+        assert_eq!(
+            parse_congestion_initial_window(" 30000 "),
+            Ok(30_000),
+            "whitespace is trimmed"
+        );
+        assert_eq!(
+            parse_congestion_initial_window(&CONGESTION_INITIAL_WINDOW_MIN.to_string()),
+            Ok(CONGESTION_INITIAL_WINDOW_MIN),
+            "bounds are inclusive"
+        );
+        assert_eq!(
+            parse_congestion_initial_window(&CONGESTION_INITIAL_WINDOW_MAX.to_string()),
+            Ok(CONGESTION_INITIAL_WINDOW_MAX),
+            "bounds are inclusive"
+        );
+        for rejected in [
+            "0",
+            "-1",
+            "not-a-number",
+            &(CONGESTION_INITIAL_WINDOW_MIN - 1).to_string(),
+            &(CONGESTION_INITIAL_WINDOW_MAX + 1).to_string(),
+        ] {
+            assert!(
+                parse_congestion_initial_window(rejected).is_err(),
+                "{rejected} should be rejected"
+            );
+        }
+    }
 }
