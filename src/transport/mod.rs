@@ -9,7 +9,7 @@ pub mod paths;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{AckFrequencyConfig, QuicTransportConfig, VarInt};
-use noq_proto::congestion::CubicConfig;
+use noq_proto::congestion::Bbr3Config;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,14 +111,14 @@ pub const QUIC_ACK_ELICITING_THRESHOLD: u32 = 15;
 ///
 /// Pinned to 1 — the behavior QUIC has without the ACK Frequency extension —
 /// so any reordered packet is acknowledged immediately and the sender detects
-/// loss (and Cubic reacts to it) as promptly as with per-packet ACKs. The
+/// loss as promptly as with per-packet ACKs. The
 /// noq default of 2 would delay that signal by a packet; only in-order bulk
 /// flow is meant to benefit from the reduced ACK rate.
 pub const QUIC_ACK_REORDERING_THRESHOLD: u32 = 1;
 
 /// Build the fixed QUIC transport config used by both client and server.
 ///
-/// Every setting is a constant: Cubic congestion control, 8 MB windows, the
+/// Every setting is a constant: BBRv3 congestion control, 8 MB windows, the
 /// keep-alive/idle timers above, and the protocol-minimum initial MTU. Both
 /// sides applying the identical config means nothing has to be negotiated.
 pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
@@ -131,17 +131,12 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     transport_config = transport_config.max_idle_timeout(Some(idle_timeout));
     transport_config = transport_config.keep_alive_interval(QUIC_KEEP_ALIVE_INTERVAL);
 
-    // Cubic congestion control. BBRv3 was tried first (its pacing model is
-    // attractive for TCP-in-datagram tunnels), but noq's implementation
-    // collapses to its minimum congestion window after a burst-loss episode and
-    // never recovers — measured on an uncapped LAN path: the server→client
-    // direction dropped from >1 Gbit/s to ~100 Mbit/s for the remaining
-    // lifetime of the connection (cwnd pinned at min_pipe_cwnd with a poisoned
-    // max_bw estimate). Cubic recovers from the same loss bursts within RTTs
-    // and sustains ~40% more throughput even before any loss. Revisit if noq's
-    // BBRv3 gains a working loss-recovery path.
+    // BBRv3 uses a bandwidth/RTT model and explicitly paces transmissions. That
+    // is important for a VPN carrying TCP inside QUIC DATAGRAMs: Cubic reacts
+    // to the same loss as the inner TCP connection, multiplying congestion-window
+    // reductions, while bursty sends overflow small platform UDP socket queues.
     transport_config =
-        transport_config.congestion_controller_factory(Arc::new(CubicConfig::default()));
+        transport_config.congestion_controller_factory(Arc::new(Bbr3Config::default()));
 
     // Fixed flow-control windows for connection + streams.
     transport_config = transport_config.receive_window(QUIC_WINDOW_SIZE.into());
