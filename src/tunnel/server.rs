@@ -18,8 +18,8 @@ use crate::tunnel::offload::VirtioNetHdr;
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
 use crate::transport::SERVER_ADDR_PUBLISH_INTERVAL;
 use crate::tunnel::signaling::{
-    MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse, read_message,
-    write_message,
+    ClientAuthPayload, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse,
+    read_message, write_message,
 };
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -955,6 +955,48 @@ impl VpnServer {
         Ok(())
     }
 
+    /// Verify a client's public-key credential: the claimed endpoint id must
+    /// equal the connection's TLS-authenticated `remote_id`, the signature must
+    /// verify under the presented public key, and the key must be on the
+    /// authorized-keys set. Failures are logged (with the reason) but the wire
+    /// rejection stays generic.
+    fn verify_client_auth(&self, auth: &ClientAuthPayload, remote_id: &EndpointId) -> bool {
+        let claimed = match auth.endpoint_id.parse::<EndpointId>() {
+            Ok(claimed) => claimed,
+            Err(e) => {
+                log::warn!("Client {remote_id} sent an unparseable claimed endpoint id: {e}");
+                return false;
+            }
+        };
+        if claimed != *remote_id {
+            log::warn!(
+                "Client {remote_id} claimed a different endpoint id ({claimed}) in its \
+                 auth payload"
+            );
+            return false;
+        }
+        let public = match auth.public_key.parse::<flexaccess_keys::PublicKey>() {
+            Ok(public) => public,
+            Err(e) => {
+                log::warn!("Client {remote_id} sent an invalid public key: {e}");
+                return false;
+            }
+        };
+        if !self.config.authorized_keys.contains(&public) {
+            log::warn!(
+                "Client {remote_id} presented a key that is not on the authorized-keys \
+                 file: {}",
+                auth.public_key
+            );
+            return false;
+        }
+        if !crate::auth::verify_endpoint_id_signature(&public, remote_id, &auth.signature) {
+            log::warn!("Client {remote_id} sent an invalid auth signature");
+            return false;
+        }
+        true
+    }
+
     /// Handle an incoming VPN connection.
     async fn handle_connection(
         &self,
@@ -987,37 +1029,17 @@ impl VpnServer {
             handshake.device_id
         );
 
-        // Validate auth token (required - server must have auth_tokens configured)
-        if let Some(ref valid_tokens) = self.config.auth_tokens {
-            match &handshake.auth_token {
-                Some(client_token) if valid_tokens.contains(client_token) => {
-                    log::debug!("Client {} provided valid auth token", remote_id);
-                }
-                Some(_) => {
-                    log::warn!("Client {} provided invalid auth token", remote_id);
-                    let response = VpnHandshakeResponse::rejected("Invalid authentication token");
-                    write_message(&mut send, &response.encode()?).await?;
-                    let _ = send.finish();
-                    return Err(VpnError::Signaling("Invalid authentication token".into()));
-                }
-                None => {
-                    log::warn!("Client {} missing required auth token", remote_id);
-                    let response = VpnHandshakeResponse::rejected("Authentication token required");
-                    write_message(&mut send, &response.encode()?).await?;
-                    let _ = send.finish();
-                    return Err(VpnError::Signaling("Authentication token required".into()));
-                }
-            }
-        } else {
-            // Server misconfigured - should always have auth_tokens
-            log::error!("Server has no auth tokens configured - rejecting connection");
-            let response = VpnHandshakeResponse::rejected("Server misconfigured");
+        // Verify the client's public-key credential. Failures are logged with
+        // the specific reason; the wire rejection stays generic.
+        if !self.verify_client_auth(&handshake.auth, &remote_id) {
+            let response = VpnHandshakeResponse::rejected("Public-key authentication failed");
             write_message(&mut send, &response.encode()?).await?;
             let _ = send.finish();
             return Err(VpnError::Signaling(
-                "Server has no auth tokens configured".into(),
+                "Public-key authentication failed".into(),
             ));
         }
+        log::debug!("Client {} authenticated", remote_id);
 
         // Monitor and report connection path changes (e.g., relay -> direct)
         let _path_watcher =

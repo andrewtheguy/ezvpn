@@ -13,6 +13,9 @@
 #![cfg_attr(target_os = "ios", allow(unused_imports, dead_code))]
 
 use crate::net::buffer::uninitialized_vec;
+// Not iOS-gated: `perform_handshake` is the shared connect path, used by the
+// iOS session too.
+use crate::auth::ClientKey;
 #[cfg(not(target_os = "ios"))]
 use crate::config::VpnClientConfig;
 use crate::tunnel::stream::{
@@ -33,8 +36,8 @@ use crate::tunnel::offload::VirtioNetHdr;
 use crate::transport::paths::watch_connection_paths;
 use crate::config::VPN_MTU;
 use crate::tunnel::signaling::{
-    MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse, read_message,
-    write_message,
+    ClientAuthPayload, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse,
+    read_message, write_message,
 };
 use crate::transport::endpoint::{connect_with_timeout, RelayConfig};
 use bytes::{Bytes, BytesMut};
@@ -320,7 +323,8 @@ impl VpnClient {
 
         // Perform handshake on the first bi-stream; it stays open as the
         // reliable data stream afterwards.
-        let (server_info, data_send, data_recv) = self.perform_handshake(&connection).await?;
+        let (server_info, data_send, data_recv) =
+            self.perform_handshake(&connection, endpoint.id()).await?;
 
         // Monitor and report connection path changes (e.g., relay -> direct)
         let _path_watcher = watch_connection_paths(&connection, "Connection");
@@ -635,8 +639,9 @@ impl VpnClient {
     async fn perform_handshake(
         &self,
         connection: &iroh::endpoint::Connection,
+        own_id: EndpointId,
     ) -> VpnResult<(ServerInfo, SendStream, RecvStream)> {
-        perform_handshake(connection, self.device_id, self.config.auth_token.as_deref()).await
+        perform_handshake(connection, self.device_id, &self.config.client_key, own_id).await
     }
 
     /// Create and configure the TUN device.
@@ -782,12 +787,14 @@ impl VpnClient {
 /// Shared by the desktop [`VpnClient`] and the iOS connect path
 /// ([`crate::tunnel::ios`]): both open a bi-stream, send a [`VpnHandshake`]
 /// (advertising data-channel GSO), and parse the [`VpnHandshakeResponse`]. The
-/// `device_id` keys the server's idempotent IP allocation; `auth_token` is the
-/// optional pre-shared credential.
+/// `device_id` keys the server's idempotent IP allocation; `client_key` signs
+/// `own_id` (this client's own ephemeral endpoint id) so the credential is
+/// bound to this connection and cannot be replayed from another endpoint.
 pub(crate) async fn perform_handshake(
     connection: &Connection,
     device_id: u64,
-    auth_token: Option<&str>,
+    client_key: &ClientKey,
+    own_id: EndpointId,
 ) -> VpnResult<(ServerInfo, SendStream, RecvStream)> {
     // Open the bidirectional stream used for the handshake and, once the
     // response is in, all data frames.
@@ -798,10 +805,14 @@ pub(crate) async fn perform_handshake(
 
     // Send handshake. GSO is not negotiated (IP packets ride datagrams, which
     // never carry offload super-frames); each side's TUN offload is local.
-    let mut handshake = VpnHandshake::new(device_id);
-    if let Some(token) = auth_token {
-        handshake = handshake.with_auth_token(token);
-    }
+    let handshake = VpnHandshake::new(
+        device_id,
+        ClientAuthPayload {
+            public_key: client_key.public_str(),
+            endpoint_id: own_id.to_string(),
+            signature: client_key.sign_endpoint_id(&own_id),
+        },
+    );
 
     write_message(&mut send, &handshake.encode()?).await?;
 

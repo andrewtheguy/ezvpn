@@ -36,12 +36,41 @@ typedef struct EzvpnHandle EzvpnHandle;
 void ezvpn_init_logging(void);
 
 /*
+ * Generate a fresh client authentication keypair.
+ *
+ * out_buf/out_len : caller buffer. On success receives
+ *   {"created":"<UTC>","public_key":"ed25519-pub:...",
+ *    "secret_key":"ed25519-sec:..."}
+ *   Store the secret key in the keychain and pass it back as the config's
+ *   auth_key; show the public key (never a secret) so the user can put it on
+ *   the server's authorized_keys file.
+ *
+ * Returns 1 on success, 0 if out_buf is too small.
+ */
+int ezvpn_generate_client_key(char *out_buf, size_t out_len);
+
+/*
+ * Derive the public key ("ed25519-pub:...") of a stored secret key, so the app
+ * can display it without persisting it separately.
+ *
+ * secret_key : NUL-terminated UTF-8 "ed25519-sec:..." token.
+ * out_buf/out_len : receives the public key on success, or an error message on
+ *   failure. Always NUL-terminated.
+ *
+ * Returns 1 on success, 0 on failure (invalid secret, or out_buf too small —
+ * in which case out_buf holds truncated output rather than a diagnostic).
+ */
+int ezvpn_client_public_key(const char *secret_key, char *out_buf, size_t out_len);
+
+/*
  * Connect to the server and perform the handshake.
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
- *   {"server_node_id":"<id>","auth_token":null,
+ *   {"server_node_id":"<id>","auth_key":"ed25519-sec:...",
  *    "relay_urls":[],
  *    "routes":["10.0.0.0/8"],"routes6":["fd00::/8"]}
+ *   auth_key is the client's ed25519 secret key; its public half must be on
+ *   the server's authorized_keys file. It and server_node_id are required.
  *   routes/routes6 are the split-tunnel prefixes; they are used to compute which
  *   server underlay addresses overlap and must be excluded from the tunnel.
  *   Only global-scope (public) addresses are ever excluded; the server's

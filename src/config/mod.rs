@@ -4,10 +4,10 @@
 // it (which needs `crate::runtime::config_dir`) is gated off iOS.
 pub mod file_config;
 
+use crate::auth::{AuthorizedKeys, ClientKey};
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Fixed VPN tunnel MTU — a protocol constant, not a configuration knob.
@@ -125,42 +125,36 @@ pub fn validate_vpn_networks(
 }
 
 /// VPN server configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct VpnServerConfig {
     /// VPN network CIDR (e.g., "10.0.0.0/24"). Optional for IPv6-only mode.
     /// Server gets .1 by default, clients get subsequent addresses.
     /// At least one of `network` (IPv4) or `network6` (IPv6) must be configured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<Ipv4Net>,
 
     /// IPv6 VPN network CIDR (e.g., "fd00::/64"). Optional for dual-stack or IPv6-only.
     /// Server gets ::1 by default, clients get subsequent addresses.
     /// At least one of `network` (IPv4) or `network6` (IPv6) must be configured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network6: Option<Ipv6Net>,
 
     /// Server's VPN IP address (defaults to first host in network, e.g., .1).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_ip: Option<Ipv4Addr>,
 
     /// Server's IPv6 VPN address (defaults to first host in network6, e.g., ::1).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_ip6: Option<Ipv6Addr>,
 
     /// IPv6 address-assignment strategy (default: sequential).
     /// `NodeId` derives stateless deterministic addresses from iroh node ids
     /// and requires `network6` of /64 or wider with no `server_ip6` override.
-    #[serde(default)]
     pub ip6_strategy: Ip6Strategy,
 
     /// Maximum number of connected clients.
-    #[serde(default = "default_max_clients")]
     pub max_clients: usize,
 
-    /// Valid authentication tokens (clients must provide one to connect).
-    /// Uses ezvpn auth-token format (`v` + 46 Base64URL chars, no padding).
-    #[serde(default)]
-    pub auth_tokens: Option<HashSet<String>>,
+    /// Authorized client public keys (`ed25519-pub:`), loaded from the server's
+    /// authorized-keys file at startup. A client's handshake credential must be
+    /// on this set (see [`crate::auth`]).
+    pub authorized_keys: AuthorizedKeys,
 }
 
 impl VpnServerConfig {
@@ -184,21 +178,21 @@ impl VpnServerConfig {
 }
 
 /// VPN client configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct VpnClientConfig {
     /// Server's iroh node ID.
     pub server_node_id: String,
 
-    /// Authentication token (ezvpn auth-token format: `v` + Base64URL payload).
-    pub auth_token: Option<String>,
+    /// Client authentication keypair. Its public half must be on the server's
+    /// authorized-keys file; the handshake presents it plus a signature over
+    /// this client's own ephemeral endpoint id (see [`crate::auth`]).
+    pub client_key: ClientKey,
 
     /// IPv4 routes to send through the VPN (CIDRs), e.g., 0.0.0.0/0 for full tunnel.
     /// Optional: with no routes configured, only the assigned VPN addresses are reachable.
-    #[serde(default)]
     pub routes: Vec<Ipv4Net>,
 
     /// IPv6 routes to send through the VPN (CIDRs). Optional for dual-stack.
-    #[serde(default)]
     pub routes6: Vec<Ipv6Net>,
 }
 
@@ -219,11 +213,6 @@ impl VpnClientConfig {
     }
 }
 
-// Default value functions for serde
-fn default_max_clients() -> usize {
-    254
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,7 +225,16 @@ mod tests {
             server_ip6: None,
             ip6_strategy: Ip6Strategy::Sequential,
             max_clients: 254,
-            auth_tokens: None,
+            authorized_keys: AuthorizedKeys::default(),
+        }
+    }
+
+    fn minimal_client_config(server_node_id: String) -> VpnClientConfig {
+        VpnClientConfig {
+            server_node_id,
+            client_key: ClientKey::generate(),
+            routes: vec![],
+            routes6: vec![],
         }
     }
 
@@ -375,7 +373,7 @@ mod tests {
 
     #[test]
     fn test_validate_client_requires_server_node_id() {
-        let mut config = VpnClientConfig::default();
+        let mut config = minimal_client_config(String::new());
         config.routes.push("0.0.0.0/0".parse().unwrap());
         let result = config.validate();
         assert!(result.is_err());
@@ -384,20 +382,14 @@ mod tests {
 
     #[test]
     fn test_validate_client_ok() {
-        let config = VpnClientConfig {
-            server_node_id: random_server_node_id(),
-            routes: vec!["0.0.0.0/0".parse().unwrap()],
-            ..Default::default()
-        };
+        let mut config = minimal_client_config(random_server_node_id());
+        config.routes = vec!["0.0.0.0/0".parse().unwrap()];
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_validate_client_no_routes_ok() {
-        let config = VpnClientConfig {
-            server_node_id: random_server_node_id(),
-            ..Default::default()
-        };
+        let config = minimal_client_config(random_server_node_id());
         assert!(config.validate().is_ok());
     }
 }

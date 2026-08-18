@@ -8,6 +8,14 @@ Architecture and design notes live in `docs/Architecture.md`. In particular, see
 Network Consistency Check (Reconnect)" (how the client handles a reassigned IP vs
 other server param changes on reconnect).
 
+Client authentication uses the shared FlexAccess ed25519 key format from
+https://github.com/flexaccessdev/flexaccess-keys (the same one flextunnel uses):
+that repo owns the `ed25519-sec:` / `ed25519-pub:` tokens, key files,
+authorized-keys parsing, and the `generate-auth-key` / `show-auth-key` CLI.
+`src/auth.rs` here owns only ezvpn's domain-separated signing transcript
+(`ezvpn-client-auth-v1`) and the authorization decision. Do not add key
+generation to the ezvpn CLI.
+
 The iroh transport layer shared with tunnel-rs and flextunnel — relays and
 address lookup, the per-relay startup probe, relay auth tokens, relay
 self-hosting — is documented once in

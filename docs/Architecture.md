@@ -125,8 +125,8 @@ sequenceDiagram
     SI-->>CI: Connection established
 
     Note over C,S: VPN Handshake Phase
-    C->>S: VpnHandshake {device_id, auth_token}
-    S->>S: Validate auth token
+    C->>S: VpnHandshake {device_id, auth: public_key + endpoint_id + signature}
+    S->>S: Verify claimed id == remote_id, key on authorized_keys, signature valid
     S->>S: Allocate IP(s) from pool(s)
     S-->>C: VpnHandshakeResponse {assigned_ip, network, server_ip, ...}
     S->>S: Store client (EndpointId, device_id)
@@ -183,15 +183,15 @@ The VPN mode maps each raw IP packet **directly to one unreliable, unordered QUI
 
 **Device ID Generation:**
 
-The `device_id` is generated at startup with `rand::rng().random::<u64>()`. It is a random session identifier, not an authentication secret; security relies on the server's iroh endpoint identity and the configured auth token.
+The `device_id` is generated at startup with `rand::rng().random::<u64>()`. It is a random session identifier, not an authentication secret; security relies on the server's iroh endpoint identity and the client's authentication keypair.
 
 **Security Considerations:**
 
 The `device_id` is used **purely for session tracking** within an already-authenticated iroh connection—it is NOT used for access control. Security relies on:
 1. iroh's cryptographic server `EndpointId` authentication and QUIC/TLS encryption
-2. Auth token validation
+2. Client public-key authentication (see "Client Authentication")
 
-Clients are keyed by `(EndpointId, device_id)`, so an attacker cannot hijack a session by guessing a `device_id` without also possessing the victim's iroh private key and a valid auth token.
+Clients are keyed by `(EndpointId, device_id)`, so an attacker cannot hijack a session by guessing a `device_id` without also possessing the victim's iroh private key and an authorized client keypair.
 
 **Collision Handling:**
 
@@ -486,16 +486,16 @@ simply ignores `0x01` frames.
 ### Security Model
 
 The security model is private-resource access, not anonymity. Server identity,
-auth tokens, and QUIC/TLS encryption protect the tunnel from unauthorized peers
-and keep VPN payloads confidential from iroh relays.
+client public-key authentication, and QUIC/TLS encryption protect the tunnel
+from unauthorized peers and keep VPN payloads confidential from iroh relays.
 Relays and discovery services may still see metadata such as participating
 endpoints, timing, volume, and relay use when they are involved.
 
 ```mermaid
 graph TB
     subgraph "Authentication"
-        A[Auth Token<br/>ezvpn token format]
-        B[Validate before IP assignment]
+        A[Client keypair<br/>ed25519, flexaccess-keys format]
+        B[Verify before IP assignment]
     end
 
     subgraph "Encryption"
@@ -541,8 +541,37 @@ and the routing table already reveal locally.
 
 There are two independent version numbers, checked at two different layers:
 
-- **ALPN/format version** — the advertised ALPN is the fixed value `ezvpn/7`, where `7` is the ALPN/format version (kept in lockstep with the wire protocol version). A peer whose ALPN does not match exactly (e.g. the reliable-stream `ezvpn/6`, the earlier datagram-based `ezvpn/5`, or the token-bearing `ezvpn/4/<token>` of older builds) is rejected during QUIC ALPN negotiation, before any application streams are opened. It carries no embedded secret; access control rests on the server's iroh endpoint identity and the auth token.
-- **Wire protocol version** — `VPN_PROTOCOL_VERSION` (currently `7`) is carried inside the application handshake and is independent of the ALPN version. A peer that negotiates a matching ALPN but sends a mismatched wire protocol version is rejected during the handshake exchange, not during QUIC negotiation.
+- **ALPN/format version** — the advertised ALPN is the fixed value `ezvpn/8`, where `8` is the ALPN/format version (kept in lockstep with the wire protocol version). A peer whose ALPN does not match exactly (e.g. the token-authenticated `ezvpn/7`, the reliable-stream `ezvpn/6`, or the token-bearing `ezvpn/4/<token>` of older builds) is rejected during QUIC ALPN negotiation, before any application streams are opened. It carries no embedded secret; access control rests on the server's iroh endpoint identity and the client's authentication keypair.
+- **Wire protocol version** — `VPN_PROTOCOL_VERSION` (currently `8`) is carried inside the application handshake and is independent of the ALPN version. A peer that negotiates a matching ALPN but sends a mismatched wire protocol version is rejected during the handshake exchange, not during QUIC negotiation. The version check runs **before** authentication, so a pre-migration (token-bearing) peer is turned away at the version gate rather than failing credential validation.
+
+#### Client Authentication
+
+Clients authenticate with an ed25519 keypair in the shared
+[flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) format
+(`ed25519-sec:` / `ed25519-pub:` tokens, key files, and the
+`generate-auth-key` / `show-auth-key` CLI all live there — this repo only
+parses, signs, and verifies). The server keeps the accepted public keys in an
+ssh-`authorized_keys`-style file (`[auth] authorized_keys_file`).
+
+The client's iroh endpoint identity stays **ephemeral**, so the credential must
+be bound to the connection rather than to a long-lived endpoint id. In its
+`VpnHandshake` the client sends its public key, its claimed endpoint id, and an
+ed25519 signature over that endpoint id, domain-separated with the context
+string `ezvpn-client-auth-v1` (`src/auth.rs`) so an ezvpn signature can never
+be confused with one made by the same key for another FlexAccess application.
+
+The server (`VpnServer::verify_client_auth`, `src/tunnel/server.rs`) checks, in
+order, that:
+
+1. the claimed endpoint id parses and equals the connection's
+   TLS-authenticated `remote_id()` — so a captured handshake cannot be replayed
+   from another endpoint;
+2. the public key parses and is on the authorized-keys set;
+3. the signature verifies under that public key.
+
+Each failure is logged with its specific reason, but the wire rejection stays
+generic (`"Public-key authentication failed"`). Verification happens before the
+connection count is incremented and before any IP is allocated.
 
 ### Client Isolation
 

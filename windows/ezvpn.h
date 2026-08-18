@@ -43,15 +43,44 @@ typedef struct EzvpnHandle EzvpnHandle;
 void ezvpn_init_logging(void);
 
 /*
+ * Generate a fresh client authentication keypair.
+ *
+ * out_buf/out_len : caller buffer. On success receives
+ *   {"created":"<UTC>","public_key":"ed25519-pub:...",
+ *    "secret_key":"ed25519-sec:..."}
+ *   Store the secret key and pass it back as the config's auth_key; show the
+ *   public key (never a secret) so the user can put it on the server's
+ *   authorized_keys file.
+ *
+ * Returns 1 on success, 0 if out_buf is too small.
+ */
+int ezvpn_generate_client_key(char *out_buf, size_t out_len);
+
+/*
+ * Derive the public key ("ed25519-pub:...") of a stored secret key, so the GUI
+ * can display it without persisting it separately.
+ *
+ * secret_key : NUL-terminated UTF-8 "ed25519-sec:..." token.
+ * out_buf/out_len : receives the public key on success, or an error message on
+ *   failure. Always NUL-terminated.
+ *
+ * Returns 1 on success, 0 on failure (invalid secret, or out_buf too small —
+ * in which case out_buf holds truncated output rather than a diagnostic).
+ */
+int ezvpn_client_public_key(const char *secret_key, char *out_buf, size_t out_len);
+
+/*
  * Start the VPN client and its (optionally reconnecting) run loop.
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
- *   {"server_node_id":"<id>","auth_token":"<47-char token>",
+ *   {"server_node_id":"<id>","auth_key":"ed25519-sec:...",
  *    "relay_urls":[],
  *    "routes":["10.0.0.0/8"],"routes6":["fd00::/8"],
  *    "instance":"default","auto_reconnect":true,"max_reconnect_attempts":null}
- *   auth_token / max_reconnect_attempts may be null. relay_urls, routes,
- *   routes6, instance, and auto_reconnect are optional.
+ *   auth_key is the client's ed25519 secret key; its public half must be on
+ *   the server's authorized_keys file. It and server_node_id are required;
+ *   max_reconnect_attempts may be null. relay_urls, routes, routes6, instance,
+ *   and auto_reconnect are optional.
  *   routes/routes6 are the split-tunnel prefixes routed through the tunnel; the
  *   server's advertised gateway host prefix is always routed in addition.
  * out_buf/out_len : caller buffer. On failure receives the error message

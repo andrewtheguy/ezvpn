@@ -1,469 +1,263 @@
-//! Token-based authentication for iroh tunnel connections.
+//! Public-key authentication for iroh VPN tunnel connections.
 //!
-//! Provides pre-shared token authentication for the iroh multi-source server.
+//! Key management is delegated to the
+//! [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys)
+//! repository: the shared `ed25519-sec:` / `ed25519-pub:` token format, key
+//! files, authorized-keys parsing, and the `generate-auth-key` /
+//! `show-auth-key` CLI all live there. This module owns only ezvpn's
+//! domain-separated authentication transcript and its authorization decision.
 //!
-//! ## Token Format
-//! - Exactly 47 characters
-//! - Starts with lowercase `v`
-//! - Remaining 46 characters are Base64URL (no padding)
-//! - Decoded payload is exactly 34 bytes:
-//!   - First 32 bytes: random entropy
-//!   - Last 2 bytes: CRC16-CCITT-FALSE checksum (big-endian) of the 32 random bytes
+//! ## Handshake
+//! The client's iroh endpoint id stays ephemeral. In its [`VpnHandshake`] the
+//! client sends its public key, its claimed endpoint id, and an ed25519
+//! signature over that endpoint id (domain-separated). The server checks that
+//! the claimed id equals the connection's TLS-authenticated `remote_id()`, that
+//! the signature verifies under the presented public key, and that the key is
+//! on the authorized-keys file — binding the credential to this connection so a
+//! captured handshake cannot be replayed from another endpoint.
 //!
-//! Generate tokens with: `ezvpn generate-auth-token`
+//! Generate client keys with `flexaccess-keys generate-auth-key`.
+//!
+//! [`VpnHandshake`]: crate::tunnel::signaling::VpnHandshake
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::Rng;
-use std::collections::HashSet;
+use flexaccess_keys::{PrivateKey, PublicKey};
+use iroh::EndpointId;
 use std::path::Path;
 
-/// Required length for authentication tokens.
-pub const TOKEN_LENGTH: usize = 47;
+pub use flexaccess_keys::AuthorizedKeys;
 
-/// Required prefix character for tokens.
-pub const TOKEN_PREFIX: char = 'v';
+/// Domain-separation context prepended to the signed message, so a client-auth
+/// signature can never be confused with any other ed25519 signature made by
+/// the same key — including one made for another FlexAccess application
+/// sharing the key format.
+const AUTH_CONTEXT: &[u8] = b"ezvpn-client-auth-v1";
 
-/// Number of random bytes in token payload.
-const RANDOM_BYTES_LEN: usize = 32;
-
-/// Number of checksum bytes in token payload.
-const CHECKSUM_BYTES_LEN: usize = 2;
-
-/// Number of decoded bytes in token payload.
-const TOKEN_PAYLOAD_LEN: usize = RANDOM_BYTES_LEN + CHECKSUM_BYTES_LEN;
-
-/// Compute CRC16-CCITT-FALSE.
-///
-/// Parameters:
-/// - Poly: 0x1021
-/// - Init: 0xFFFF
-/// - RefIn: false
-/// - RefOut: false
-/// - XorOut: 0x0000
-fn crc16_ccitt_false(data: &[u8]) -> u16 {
-    let mut crc = 0xFFFFu16;
-
-    for &byte in data {
-        crc ^= (byte as u16) << 8;
-        for _ in 0..8 {
-            if (crc & 0x8000) != 0 {
-                crc = (crc << 1) ^ 0x1021;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-
-    crc
+/// A client authentication keypair: a shared-format [`PrivateKey`] bound to
+/// ezvpn's signing transcript.
+#[derive(Clone)]
+pub struct ClientKey {
+    private: PrivateKey,
 }
 
-/// Generate a new authentication token.
-///
-/// Format: `v` + base64url_no_pad(32 random bytes + 2-byte CRC16) = 47 characters total.
-pub fn generate_token() -> String {
-    let mut random = [0u8; RANDOM_BYTES_LEN];
-    let mut rng = rand::rng();
-    rng.fill_bytes(&mut random);
-
-    let checksum = crc16_ccitt_false(&random).to_be_bytes();
-    let mut payload = [0u8; TOKEN_PAYLOAD_LEN];
-    payload[..RANDOM_BYTES_LEN].copy_from_slice(&random);
-    payload[RANDOM_BYTES_LEN..].copy_from_slice(&checksum);
-
-    format!("{}{}", TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload))
+/// `Debug` shows only the public half — the secret must never leak into
+/// logs or error context.
+impl std::fmt::Debug for ClientKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientKey")
+            .field("public", &self.public_str())
+            .finish_non_exhaustive()
+    }
 }
 
-/// Validate token format.
-///
-/// Returns Ok(()) if valid, Err with description if invalid.
-pub fn validate_token(token: &str) -> Result<()> {
-    // Early ASCII check - all valid tokens are ASCII
-    if !token.is_ascii() {
-        anyhow::bail!("Token must contain only ASCII characters");
+impl From<PrivateKey> for ClientKey {
+    fn from(private: PrivateKey) -> Self {
+        Self { private }
     }
-
-    if token.len() != TOKEN_LENGTH {
-        anyhow::bail!(
-            "Token must be exactly {} characters, got {} characters",
-            TOKEN_LENGTH,
-            token.len()
-        );
-    }
-
-    // Check prefix
-    if !token.starts_with(TOKEN_PREFIX) {
-        anyhow::bail!(
-            "Token must start with '{}', got '{}'",
-            TOKEN_PREFIX,
-            token.chars().next().unwrap_or('?')
-        );
-    }
-
-    let encoded_payload = &token[TOKEN_PREFIX.len_utf8()..];
-    let payload = URL_SAFE_NO_PAD
-        .decode(encoded_payload)
-        .context("Token payload is not valid base64url without padding")?;
-
-    if payload.len() != TOKEN_PAYLOAD_LEN {
-        anyhow::bail!(
-            "Token payload must decode to exactly {} bytes, got {} bytes",
-            TOKEN_PAYLOAD_LEN,
-            payload.len()
-        );
-    }
-
-    let random = &payload[..RANDOM_BYTES_LEN];
-    let checksum = &payload[RANDOM_BYTES_LEN..];
-    let expected_checksum = crc16_ccitt_false(random).to_be_bytes();
-
-    if checksum != expected_checksum {
-        anyhow::bail!("Token checksum is invalid");
-    }
-
-    Ok(())
 }
 
-/// Load auth tokens from CLI arguments and/or a file.
-///
-/// # Arguments
-/// * `cli_tokens` - Tokens specified via CLI `--auth-tokens` flags
-/// * `file` - Optional path to a file containing tokens (one per line)
-///
-/// # Returns
-/// A HashSet of all valid authentication tokens
-///
-/// # Errors
-/// Returns an error if the file cannot be read or any token is invalid
-pub fn load_auth_tokens(cli_tokens: &[String], file: Option<&Path>) -> Result<HashSet<String>> {
-    let mut tokens = HashSet::new();
-
-    // Load from CLI arguments
-    for token in cli_tokens {
-        let trimmed = token.trim();
-        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            validate_token(trimmed)
-                .with_context(|| format!("Invalid token from CLI: '{}'", trimmed))?;
-            tokens.insert(trimmed.to_string());
-        }
+impl ClientKey {
+    /// Generate a fresh random keypair.
+    pub fn generate() -> Self {
+        PrivateKey::generate()
+            .expect("system RNG unavailable")
+            .into()
     }
 
-    // Load from file if specified
-    if let Some(file_path) = file {
-        let file_tokens = load_auth_tokens_from_file(file_path)?;
-        tokens.extend(file_tokens);
+    /// Parse an encoded secret key (`ed25519-sec:...`).
+    pub fn from_secret_str(s: &str) -> Result<Self> {
+        let private = s
+            .parse::<PrivateKey>()
+            .map_err(anyhow::Error::from)
+            .context("Invalid authentication private key")?;
+        Ok(private.into())
     }
 
-    Ok(tokens)
+    /// The encoded secret key (`ed25519-sec:...`).
+    pub fn secret_str(&self) -> String {
+        self.private.to_token()
+    }
+
+    /// The encoded public key (`ed25519-pub:...`).
+    pub fn public_str(&self) -> String {
+        self.private.public_key().to_token()
+    }
+
+    /// The verifying half of this keypair.
+    pub fn public_key(&self) -> PublicKey {
+        self.private.public_key()
+    }
+
+    /// Sign the client-auth message binding `endpoint_id` (this client's own
+    /// ephemeral iroh id), returning the base64url signature.
+    pub fn sign_endpoint_id(&self, endpoint_id: &EndpointId) -> String {
+        let sig = self.private.sign(&auth_message(endpoint_id));
+        URL_SAFE_NO_PAD.encode(sig)
+    }
 }
 
-/// Load authentication tokens from a file.
-///
-/// # File Format
-/// - One token per line (`v` + 46 Base64URL chars, no padding)
-/// - Lines starting with `#` are treated as comments
-/// - Empty lines are ignored
-/// - Inline comments (after token) are supported with `#`
-///
-/// # Example file:
-/// ```text
-/// # Authentication tokens (generate with: ezvpn generate-auth-token)
-/// vmfNFxTPDKB3jsM1Q8kzAvZnQHbmJ1W49Rk8i1S2Jzrze9Q
-/// vh9SwOUD1nHkQpl4Gf0fQrVrRIt6QctNfPzIlcwkPhzv0ig
-/// ```
-pub fn load_auth_tokens_from_file(path: &Path) -> Result<HashSet<String>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read auth tokens file: {}", path.display()))?;
-
-    let mut tokens = HashSet::new();
-
-    for (line_num, line) in content.lines().enumerate() {
-        let line_num = line_num + 1; // 1-based line numbers
-        let line = line.trim();
-
-        // Skip empty lines and comment lines
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Handle inline comments: take only the part before #
-        let token = line.split('#').next().unwrap_or(line).trim();
-
-        if !token.is_empty() {
-            validate_token(token).with_context(|| {
-                format!(
-                    "Invalid token at {}:{}: '{}'",
-                    path.display(),
-                    line_num,
-                    token
-                )
-            })?;
-            tokens.insert(token.to_string());
-        }
-    }
-
-    Ok(tokens)
+/// The signed message: domain-separation context + the raw endpoint-id bytes.
+fn auth_message(endpoint_id: &EndpointId) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(AUTH_CONTEXT.len() + 32);
+    msg.extend_from_slice(AUTH_CONTEXT);
+    msg.extend_from_slice(endpoint_id.as_bytes());
+    msg
 }
 
-/// Load a single auth token from a file.
-///
-/// # File Format
-/// - First non-empty, non-comment line is the token (`v` + 46 Base64URL chars, no padding)
-/// - Lines starting with `#` are treated as comments
-/// - Empty lines are ignored
-/// - Inline comments (after token) are supported with `#`
-pub fn load_auth_token_from_file(path: &Path) -> Result<String> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read auth token file: {}", path.display()))?;
+/// Verify a base64url client-auth signature over `endpoint_id` under `public`.
+pub fn verify_endpoint_id_signature(
+    public: &PublicKey,
+    endpoint_id: &EndpointId,
+    signature_b64: &str,
+) -> bool {
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(signature_b64) else {
+        return false;
+    };
+    public.verify(&auth_message(endpoint_id), &bytes)
+}
 
-    for (line_num, line) in content.lines().enumerate() {
-        let line_num = line_num + 1; // 1-based line numbers
-        let line = line.trim();
+/// Load a client secret key from a shared-format key file (a bare
+/// `ed25519-sec:...` token, or the token preceded by `#` header lines).
+pub fn load_client_key_from_file(path: &Path) -> Result<ClientKey> {
+    let private = flexaccess_keys::load_private_key(path).map_err(anyhow::Error::from)?;
+    Ok(private.into())
+}
 
-        // Skip empty lines and comment lines
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Handle inline comments: take only the part before #
-        let token = line.split('#').next().unwrap_or(line).trim();
-
-        if !token.is_empty() {
-            validate_token(token).with_context(|| {
-                format!(
-                    "Invalid token at {}:{}: '{}'",
-                    path.display(),
-                    line_num,
-                    token
-                )
-            })?;
-            return Ok(token.to_string());
-        }
-    }
-
-    anyhow::bail!("No valid token found in file: {}", path.display())
+/// Load the server's authorized client public keys (shared authorized-keys
+/// document: one `ed25519-pub:...` per line, optional trailing comment, `#`
+/// lines and blank lines ignored).
+pub fn load_authorized_keys(path: &Path) -> Result<AuthorizedKeys> {
+    flexaccess_keys::load_authorized_keys(path).map_err(anyhow::Error::from)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flexaccess_keys::{PRIVATE_KEY_PREFIX, PUBLIC_KEY_PREFIX};
+    use iroh::SecretKey;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    fn make_test_token(random: [u8; RANDOM_BYTES_LEN]) -> String {
-        let checksum = crc16_ccitt_false(&random).to_be_bytes();
-        let mut payload = [0u8; TOKEN_PAYLOAD_LEN];
-        payload[..RANDOM_BYTES_LEN].copy_from_slice(&random);
-        payload[RANDOM_BYTES_LEN..].copy_from_slice(&checksum);
-        format!("{}{}", TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload))
-    }
-
-    fn decode_payload(token: &str) -> Vec<u8> {
-        URL_SAFE_NO_PAD
-            .decode(&token[TOKEN_PREFIX.len_utf8()..])
-            .unwrap()
+    fn ephemeral_endpoint_id() -> EndpointId {
+        let bytes: [u8; 32] = rand::random();
+        SecretKey::from_bytes(&bytes).public()
     }
 
     #[test]
-    fn test_crc16_ccitt_false_known_vector() {
-        // Standard check value for CRC16-CCITT-FALSE with "123456789".
-        assert_eq!(crc16_ccitt_false(b"123456789"), 0x29B1);
+    fn keypair_roundtrip() {
+        let key = ClientKey::generate();
+        let secret = key.secret_str();
+        assert!(secret.starts_with(PRIVATE_KEY_PREFIX));
+        let public = key.public_str();
+        assert!(public.starts_with(PUBLIC_KEY_PREFIX));
+
+        let reparsed = ClientKey::from_secret_str(&secret).unwrap();
+        assert_eq!(reparsed.public_str(), public);
+        assert_eq!(public.parse::<PublicKey>().unwrap(), key.public_key());
     }
 
     #[test]
-    fn test_generate_token_format() {
-        let token = generate_token();
-        assert_eq!(token.len(), TOKEN_LENGTH);
-        assert!(token.starts_with(TOKEN_PREFIX));
-        assert!(validate_token(&token).is_ok());
-    }
-
-    #[test]
-    fn test_generate_token_uniqueness() {
-        let token1 = generate_token();
-        let token2 = generate_token();
-        assert_ne!(token1, token2);
-    }
-
-    #[test]
-    fn test_validate_token_valid() {
-        let token = make_test_token([0xAB; RANDOM_BYTES_LEN]);
-        assert!(validate_token(&token).is_ok());
-    }
-
-    #[test]
-    fn test_validate_token_too_short() {
-        let result = validate_token("vshort");
-        assert!(result.is_err());
+    fn secret_str_rejects_bad_inputs() {
+        // Wrong prefix (a public key is not a secret key).
+        let key = ClientKey::generate();
+        assert!(ClientKey::from_secret_str(&key.public_str()).is_err());
+        // Bad base64.
+        assert!(ClientKey::from_secret_str("ed25519-sec:!!!").is_err());
+        // Wrong length.
+        let short = format!("{}{}", PRIVATE_KEY_PREFIX, URL_SAFE_NO_PAD.encode([0u8; 16]));
+        assert!(ClientKey::from_secret_str(&short).is_err());
+        // The retired ezvpn auth-token format is rejected, not migrated.
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("exactly 47 characters")
+            ClientKey::from_secret_str("vmfNFxTPDKB3jsM1Q8kzAvZnQHbmJ1W49Rk8i1S2Jzrze9Q").is_err()
         );
     }
 
     #[test]
-    fn test_validate_token_too_long() {
-        let token = format!("{}{}", TOKEN_PREFIX, "A".repeat(TOKEN_LENGTH));
-        let result = validate_token(&token);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("exactly 47 characters")
+    fn shared_key_file_reloads() {
+        let key = ClientKey::generate();
+        let contents = format!(
+            "# Ed25519 authentication key\n# Public key: {} alice laptop\n{}\n",
+            key.public_str(),
+            key.secret_str()
         );
-    }
-
-    #[test]
-    fn test_validate_token_wrong_prefix() {
-        let mut token = generate_token().chars().collect::<Vec<_>>();
-        token[0] = 'x';
-        let token: String = token.into_iter().collect();
-
-        let result = validate_token(&token);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("must start with 'v'")
-        );
-    }
-
-    #[test]
-    fn test_validate_token_invalid_base64url_chars() {
-        let token = format!("{}{}", TOKEN_PREFIX, "!".repeat(TOKEN_LENGTH - 1));
-        let result = validate_token(&token);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("base64url"));
-    }
-
-    #[test]
-    fn test_validate_token_non_ascii() {
-        let result = validate_token("v🔐notascii");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("ASCII"));
-    }
-
-    #[test]
-    fn test_validate_token_bad_checksum() {
-        let mut payload = decode_payload(&generate_token());
-        payload[RANDOM_BYTES_LEN] ^= 0x01;
-        let bad = format!("{}{}", TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload));
-
-        let result = validate_token(&bad);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("checksum"));
-    }
-
-    #[test]
-    fn test_validate_token_rejects_mutated_random_byte() {
-        let mut payload = decode_payload(&generate_token());
-        payload[0] ^= 0x80;
-        let bad = format!("{}{}", TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload));
-
-        let result = validate_token(&bad);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("checksum"));
-    }
-
-    #[test]
-    fn test_validate_token_rejects_mutated_checksum_byte() {
-        let mut payload = decode_payload(&generate_token());
-        payload[TOKEN_PAYLOAD_LEN - 1] ^= 0x01;
-        let bad = format!("{}{}", TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload));
-
-        let result = validate_token(&bad);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("checksum"));
-    }
-
-    #[test]
-    fn test_load_from_file_with_comments() {
         let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "# This is a comment").unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        let loaded = load_client_key_from_file(file.path()).unwrap();
+        assert_eq!(loaded.public_str(), key.public_str());
+    }
+
+    #[test]
+    fn key_file_without_secret_is_rejected() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "# only comments here").unwrap();
+        assert!(load_client_key_from_file(file.path()).is_err());
+
+        let mut bad = NamedTempFile::new().unwrap();
+        writeln!(bad, "not-a-key").unwrap();
+        assert!(load_client_key_from_file(bad.path()).is_err());
+    }
+
+    #[test]
+    fn signature_binds_endpoint_id() {
+        let key = ClientKey::generate();
+        let id = ephemeral_endpoint_id();
+        let sig = key.sign_endpoint_id(&id);
+        assert!(verify_endpoint_id_signature(&key.public_key(), &id, &sig));
+
+        // A different endpoint id (replay from another endpoint) fails.
+        let other_id = ephemeral_endpoint_id();
+        assert!(!verify_endpoint_id_signature(
+            &key.public_key(),
+            &other_id,
+            &sig
+        ));
+
+        // A different key fails.
+        let other_key = ClientKey::generate();
+        assert!(!verify_endpoint_id_signature(
+            &other_key.public_key(),
+            &id,
+            &sig
+        ));
+
+        // Garbage signatures fail instead of erroring.
+        assert!(!verify_endpoint_id_signature(&key.public_key(), &id, "!!!"));
+        assert!(!verify_endpoint_id_signature(&key.public_key(), &id, ""));
+    }
+
+    #[test]
+    fn authorized_keys_parsing() {
+        let a = ClientKey::generate();
+        let b = ClientKey::generate();
+        let c = ClientKey::generate();
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "# Authorized client keys").unwrap();
         writeln!(file).unwrap();
-        writeln!(file, "  # Another comment with leading space").unwrap();
+        writeln!(file, "{}", a.public_str()).unwrap();
+        writeln!(file, "{} alice laptop", b.public_str()).unwrap();
+        writeln!(file, "  {}   build server  ", c.public_str()).unwrap();
 
-        let result = load_auth_tokens_from_file(file.path()).unwrap();
-        assert!(result.is_empty());
+        let keys = load_authorized_keys(file.path()).unwrap();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains(&a.public_key()));
+        assert!(keys.contains(&b.public_key()));
+        assert!(keys.contains(&c.public_key()));
+        assert_eq!(keys.comment(&b.public_key()), Some("alice laptop"));
     }
 
     #[test]
-    fn test_load_from_file_with_tokens() {
-        let token_a = generate_token();
-        let token_b = generate_token();
-        let token_c = generate_token();
-
+    fn authorized_keys_invalid_key_is_rejected() {
         let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "# Auth tokens").unwrap();
-        writeln!(file, "{}", token_a).unwrap();
-        writeln!(file, "{}  # inline comment", token_b).unwrap();
-        writeln!(file, "  {}  ", token_c).unwrap();
+        writeln!(file, "# header").unwrap();
+        writeln!(file, "ed25519-pub:short").unwrap();
+        let err = load_authorized_keys(file.path()).unwrap_err();
+        assert!(err.to_string().contains(":2"), "{err}");
 
-        let result = load_auth_tokens_from_file(file.path()).unwrap();
-        assert_eq!(result.len(), 3);
-        assert!(result.contains(&token_a));
-        assert!(result.contains(&token_b));
-        assert!(result.contains(&token_c));
+        // A secret key pasted into the authorized-keys file is rejected too.
+        let mut wrong = NamedTempFile::new().unwrap();
+        writeln!(wrong, "{}", ClientKey::generate().secret_str()).unwrap();
+        assert!(load_authorized_keys(wrong.path()).is_err());
     }
-
-    #[test]
-    fn test_load_from_file_invalid_token() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "short").unwrap();
-
-        let result = load_auth_tokens_from_file(file.path());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_load_single_token_from_file() {
-        let token_a = generate_token();
-        let token_b = generate_token();
-
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "# My auth token").unwrap();
-        writeln!(file).unwrap();
-        writeln!(file, "{}  # comment", token_a).unwrap();
-        writeln!(file, "{}", token_b).unwrap(); // ignored
-
-        let result = load_auth_token_from_file(file.path()).unwrap();
-        assert_eq!(result, token_a);
-    }
-
-    #[test]
-    fn test_load_single_token_invalid() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "bad").unwrap();
-
-        let result = load_auth_token_from_file(file.path());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_load_auth_tokens_cli_and_file() {
-        let token_a = generate_token();
-        let token_b = generate_token();
-
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "{}", token_a).unwrap();
-
-        let cli_tokens = vec![token_b.clone()];
-        let result = load_auth_tokens(&cli_tokens, Some(file.path())).unwrap();
-
-        assert_eq!(result.len(), 2);
-        assert!(result.contains(&token_a));
-        assert!(result.contains(&token_b));
-    }
-
-    #[test]
-    fn test_load_auth_tokens_cli_invalid() {
-        let cli_tokens = vec!["short".to_string()];
-        let result = load_auth_tokens(&cli_tokens, None);
-        assert!(result.is_err());
-    }
-
 }

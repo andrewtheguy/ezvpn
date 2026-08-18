@@ -12,7 +12,7 @@
 #
 # Config is grouped by purpose:
 #   [network] - VPN tunnel addressing (the VPN itself)
-#   [auth]    - client authentication tokens
+#   [auth]    - authorized client public keys
 #   [iroh]    - iroh transport: identity, relays, address lookup
 #
 # There are deliberately no performance/tuning knobs (WireGuard/Tailscale
@@ -92,19 +92,21 @@ network = "10.0.0.0/24"
 # ============================================================================
 # Authentication (REQUIRED)
 # ============================================================================
-# At least one authentication method is required.
-# Clients must provide one of these tokens to connect.
+# Clients authenticate with an ed25519 keypair. Each client generates its own
+# keypair and gives you the public half; you list the accepted public keys here,
+# ssh authorized_keys style.
 #
-# Token format: exactly 47 characters (`v` + 46 Base64URL chars, no padding)
-# Generate with: ezvpn generate-auth-token
-
-# Inline tokens (for testing; prefer auth_tokens_file in production)
-# NOTE: Use either auth_tokens OR auth_tokens_file, not both.
-auth_tokens = ["<YOUR_AUTH_TOKEN>"]  # Replace with real token from generate-auth-token
-
-# Or use a file containing tokens (one per line, # comments allowed)
-# NOTE: Use either auth_tokens OR auth_tokens_file, not both.
-# auth_tokens_file = "./vpn-tokens.txt"
+# Key management lives in the standalone flexaccess-keys CLI
+# (https://github.com/flexaccessdev/flexaccess-keys):
+#   flexaccess-keys generate-auth-key "alice laptop" -o client.key   # on the client
+#   flexaccess-keys show-auth-key --private-key-file client.key      # its public entry
+#
+# File format: one `ed25519-pub:...` per line, optional trailing comment;
+# `#` lines and blank lines are ignored. Example:
+#   # ./authorized_keys
+#   ed25519-pub:AAAA...  alice laptop
+#   ed25519-pub:BBBB...  build server
+authorized_keys_file = "./authorized_keys"
 
 # ============================================================================
 # Performance Notes (no config keys)

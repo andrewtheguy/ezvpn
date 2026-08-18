@@ -13,25 +13,51 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// VPN protocol version.
 ///
-/// Version 7: each IP packet maps directly to one unreliable, unordered QUIC
+/// Version 8: the pre-shared auth token is replaced by an ed25519 public-key
+/// credential ([`ClientAuthPayload`]) in the shared flexaccess-keys format, so
+/// a pre-migration peer is turned away at the version check, before
+/// authentication, instead of failing token validation.
+///
+/// Version 7 made each IP packet map directly to one unreliable, unordered QUIC
 /// datagram (WireGuard-style — see [`crate::tunnel::stream`]). The handshake
 /// bi-stream stays open only as the control channel for server-address
-/// publications. This reverses version 6's reliable-stream data path.
+/// publications.
 /// MTU and QUIC transport tuning remain fixed, WireGuard/Tailscale-style: the
 /// tunnel MTU is the protocol constant [`crate::config::VPN_MTU`], and the
 /// transport config is [`crate::transport::build_quic_transport_config`].
-pub const VPN_PROTOCOL_VERSION: u16 = 7;
+pub const VPN_PROTOCOL_VERSION: u16 = 8;
 
 /// Fixed ALPN protocol identifier for the VPN tunnel.
 ///
 /// A peer whose advertised ALPN does not match this exact value is rejected
 /// during QUIC ALPN negotiation, before any application streams are opened.
 ///
-/// The `7` is the ALPN/format version, kept in lockstep with
+/// The `8` is the ALPN/format version, kept in lockstep with
 /// [`VPN_PROTOCOL_VERSION`]: a peer advertising a different ALPN segment
-/// (e.g. the reliable-stream `ezvpn/6` or the older datagram-based `ezvpn/5`)
+/// (e.g. the token-authenticated `ezvpn/7` or the reliable-stream `ezvpn/6`)
 /// no longer matches and QUIC negotiation rejects it before the handshake.
-pub const VPN_ALPN: &[u8] = b"ezvpn/7";
+pub const VPN_ALPN: &[u8] = b"ezvpn/8";
+
+/// Public-key credential of a client's [`VpnHandshake`] (see [`crate::auth`]).
+///
+/// Nothing in it is secret: the public key is meant to be displayed, the
+/// endpoint id is already TLS-visible, and the signature reveals nothing
+/// about the secret key — so `Debug` derives plainly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientAuthPayload {
+    /// The client's authentication public key (`ed25519-pub:...`), which
+    /// must be on the server's authorized-keys file.
+    pub public_key: String,
+    /// The iroh endpoint id this client claims to be connecting from (its
+    /// ephemeral endpoint identity). The server checks it against the
+    /// connection's TLS-authenticated `remote_id()`.
+    pub endpoint_id: String,
+    /// base64url ed25519 signature over the domain-separated `endpoint_id`
+    /// (see [`crate::auth::verify_endpoint_id_signature`]), binding the
+    /// credential to this connection so a captured handshake cannot be
+    /// replayed from another endpoint.
+    pub signature: String,
+}
 
 /// VPN handshake request from client to server.
 ///
@@ -46,25 +72,19 @@ pub struct VpnHandshake {
     pub version: u16,
     /// Client's unique device ID (randomly generated per session).
     pub device_id: u64,
-    /// Authentication token (optional, for token-based auth).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_token: Option<String>,
+    /// Public-key credential. Always present — every client authenticates with
+    /// a keypair whose public half is on the server's authorized-keys file.
+    pub auth: ClientAuthPayload,
 }
 
 impl VpnHandshake {
-    /// Create a new handshake request.
-    pub fn new(device_id: u64) -> Self {
+    /// Create a new handshake request carrying `auth` as the client credential.
+    pub fn new(device_id: u64, auth: ClientAuthPayload) -> Self {
         Self {
             version: VPN_PROTOCOL_VERSION,
             device_id,
-            auth_token: None,
+            auth,
         }
-    }
-
-    /// Set the authentication token.
-    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_token = Some(token.into());
-        self
     }
 
     /// Encode to bytes for transmission.
@@ -404,22 +424,34 @@ impl From<DataMessageType> for u8 {
 mod tests {
     use super::*;
 
+    fn test_auth() -> ClientAuthPayload {
+        ClientAuthPayload {
+            public_key: "ed25519-pub:abc".to_string(),
+            endpoint_id: "endpointid".to_string(),
+            signature: "sig".to_string(),
+        }
+    }
+
     #[test]
     fn test_handshake_roundtrip() {
-        let handshake = VpnHandshake::new(12345).with_auth_token("test-token");
+        let handshake = VpnHandshake::new(12345, test_auth());
         let encoded = handshake.encode().expect("encode handshake");
         let decoded = VpnHandshake::decode(&encoded).expect("decode handshake");
         assert_eq!(decoded.version, VPN_PROTOCOL_VERSION);
         assert_eq!(decoded.device_id, 12345);
-        assert_eq!(decoded.auth_token, Some("test-token".to_string()));
+        assert_eq!(decoded.auth.public_key, "ed25519-pub:abc");
+        assert_eq!(decoded.auth.endpoint_id, "endpointid");
+        assert_eq!(decoded.auth.signature, "sig");
     }
 
+    /// The version gate runs before any authentication, so a pre-migration
+    /// (token-bearing) peer is turned away without its credential being read.
     #[test]
     fn test_handshake_rejects_unsupported_version() {
         let raw = serde_json::to_vec(&VpnHandshake {
             version: 1,
             device_id: 7,
-            auth_token: None,
+            auth: test_auth(),
         })
         .expect("serialize handshake");
 

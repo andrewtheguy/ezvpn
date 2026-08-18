@@ -23,6 +23,10 @@ dashmap = "6"
 dirs = "6"
 env_logger = "0.11"
 etherparse = "0.20"
+# Shared FlexAccess auth key format (`ed25519-sec:` / `ed25519-pub:` tokens,
+# key files, authorized-keys parsing). Key generation is the standalone
+# `flexaccess-keys` CLI; this library only parses, signs, and verifies.
+flexaccess-keys = { git = "https://github.com/flexaccessdev/flexaccess-keys", tag = "v0.0.2", default-features = false }
 futures = "0.3"
 ipnet = { version = "2", features = ["serde"] }
 # Forked from iroh v1.0.3. This branch preserves established-path transport

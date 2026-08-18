@@ -1,7 +1,8 @@
 //! ezvpn
 //!
 //! IP-over-QUIC VPN tunnel via iroh P2P connections.
-//! Uses ezvpn auth tokens for access control and TLS 1.3/QUIC for encryption.
+//! Uses ed25519 client keypairs for access control and TLS 1.3/QUIC for
+//! encryption.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 compile_error!("the ezvpn CLI only supports Linux, macOS, and Windows");
@@ -84,19 +85,6 @@ enum Command {
         secret_file: PathBuf,
 
         /// Output the result as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Generate a client authentication token
-    ///
-    /// Tokens are shared with clients for authentication (like API keys).
-    /// Server configures accepted tokens via [auth] auth_tokens or auth_tokens_file.
-    GenerateAuthToken {
-        /// Number of tokens to generate (default: 1)
-        #[arg(short, long, default_value = "1")]
-        count: usize,
-
-        /// Output the tokens as a JSON array
         #[arg(long)]
         json: bool,
     },
@@ -202,13 +190,15 @@ enum ClientAction {
         #[arg(long = "relay-token")]
         relay_auth_token: Option<String>,
 
-        /// Authentication token to send to server
-        #[arg(long)]
-        auth_token: Option<String>,
+        /// Inline client secret key (`ed25519-sec:...`) used to authenticate to
+        /// the server. Prefer --auth-key-file; an inline secret is visible in
+        /// the process list.
+        #[arg(long, conflicts_with = "auth_key_file")]
+        auth_key: Option<String>,
 
-        /// Path to file containing authentication token
+        /// Path to the client key file (from `flexaccess-keys generate-auth-key`)
         #[arg(long)]
-        auth_token_file: Option<PathBuf>,
+        auth_key_file: Option<PathBuf>,
 
         /// Additional IPv4 route CIDRs through the VPN (optional, repeatable).
         /// The server's VPN address is always routed by default.
@@ -362,8 +352,8 @@ fn main() -> Result<()> {
                     server_node_id,
                     relay_urls,
                     relay_auth_token,
-                    auth_token,
-                    auth_token_file,
+                    auth_key,
+                    auth_key_file,
                     routes,
                     routes6,
                     auto_reconnect,
@@ -381,8 +371,8 @@ fn main() -> Result<()> {
                 server_node_id,
                 relay_urls,
                 relay_auth_token,
-                auth_token,
-                auth_token_file,
+                auth_key,
+                auth_key_file,
                 routes,
                 routes6,
                 auto_reconnect,
@@ -423,18 +413,6 @@ fn main() -> Result<()> {
         Command::ShowServerId { secret_file, json } => {
             init_logger();
             secret::show_id(expand_tilde(&secret_file), json)
-        }
-        Command::GenerateAuthToken { count, json } => {
-            init_logger();
-            let tokens: Vec<String> = (0..count).map(|_| auth::generate_token()).collect();
-            if json {
-                println!("{}", serde_json::to_string_pretty(&tokens)?);
-            } else {
-                for token in &tokens {
-                    println!("{token}");
-                }
-            }
-            Ok(())
         }
         // Everything else is async but never daemonizes: run on a fresh runtime.
         command => {
@@ -504,8 +482,7 @@ async fn run_async(command: Command) -> Result<()> {
             action: ClientAction::Start { .. },
         }
         | Command::GenerateServerKey { .. }
-        | Command::ShowServerId { .. }
-        | Command::GenerateAuthToken { .. } => {
+        | Command::ShowServerId { .. } => {
             unreachable!("dispatched synchronously in main()")
         }
     }
@@ -520,8 +497,8 @@ fn prepare_client_start(
     server_node_id: Option<String>,
     relay_urls: Vec<String>,
     relay_auth_token: Option<String>,
-    auth_token: Option<String>,
-    auth_token_file: Option<PathBuf>,
+    auth_key: Option<String>,
+    auth_key_file: Option<PathBuf>,
     routes: Vec<String>,
     routes6: Vec<String>,
     auto_reconnect: bool,
@@ -559,8 +536,8 @@ fn prepare_client_start(
         .apply_config(cfg.as_ref())
         .apply_cli(
             server_node_id,
-            auth_token,
-            auth_token_file.map(|p| expand_tilde(&p)),
+            auth_key,
+            auth_key_file.map(|p| expand_tilde(&p)),
             routes,
             routes6,
             relay_urls,
@@ -575,7 +552,7 @@ fn prepare_client_start(
 /// absolute paths (the daemon does `chdir("/")`). Errors are reported in the
 /// foreground before the fork.
 fn canonicalize_client_paths(resolved: &mut ResolvedVpnClientConfig) -> Result<()> {
-    for (field, slot) in [("auth token file", &mut resolved.auth_token_file)] {
+    for (field, slot) in [("auth key file", &mut resolved.auth_key_file)] {
         if let Some(path) = slot.as_ref() {
             let abs = std::fs::canonicalize(path)
                 .with_context(|| format!("resolving {field} {}", path.display()))?;
@@ -920,20 +897,25 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         .transpose()
         .context("Invalid server IPv6 address")?;
 
-    // Load and validate auth tokens (required for VPN server)
-    let valid_tokens =
-        auth::load_auth_tokens(&resolved.auth_tokens, resolved.auth_tokens_file.as_deref())
-            .context("Failed to load authentication tokens")?;
+    // Load the authorized client public keys (required for VPN server)
+    let authorized_keys = match resolved.authorized_keys_file.as_deref() {
+        Some(path) => {
+            auth::load_authorized_keys(path).context("Failed to load the authorized client keys")?
+        }
+        None => Default::default(),
+    };
 
-    if valid_tokens.is_empty() {
+    if authorized_keys.is_empty() {
         anyhow::bail!(
-            "VPN server requires at least one authentication token.\n\
-             Generate one with: ezvpn generate-auth-token\n\
-             Then add to config file: auth_tokens = [\"<TOKEN>\"]"
+            "VPN server requires at least one authorized client public key.\n\
+             Each client generates a keypair with: flexaccess-keys generate-auth-key -o <FILE>\n\
+             Put each key's authorized-key entry (one `ed25519-pub:...` per line, from \
+             `flexaccess-keys show-auth-key --private-key-file <FILE>`) in a file and set \
+             authorized_keys_file in the config."
         );
     }
 
-    log::info!("Loaded {} authentication token(s)", valid_tokens.len());
+    log::info!("Loaded {} authorized client key(s)", authorized_keys.len());
 
     // Load secret key for persistent iroh identity (required for server)
     let secret_key = if let Some(ref path) = resolved.secret_file {
@@ -954,7 +936,7 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         server_ip6,
         ip6_strategy: resolved.ip6_strategy,
         max_clients: 254,
-        auth_tokens: Some(valid_tokens),
+        authorized_keys,
     };
 
     // Fail fast if we lack the privileges to create the TUN device, before
@@ -972,7 +954,7 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
 
     log::info!("VPN Server Node ID: {}", endpoint.id());
     log::info!(
-        "Clients connect with: ezvpn client start --server-node-id {} --auth-token <TOKEN>",
+        "Clients connect with: ezvpn client start --server-node-id {} --auth-key-file <KEY FILE>",
         endpoint.id()
     );
 
@@ -993,19 +975,26 @@ async fn run_vpn_client(
     instance: &str,
     daemon_log: Option<String>,
 ) -> Result<()> {
-    // Load auth token (from CLI or file)
-    let token = if let Some(ref token) = resolved.auth_token {
-        auth::validate_token(token).context("Invalid authentication token from CLI")?;
-        token.clone()
-    } else if let Some(ref path) = resolved.auth_token_file {
-        auth::load_auth_token_from_file(path)
-            .context("Failed to load authentication token from file")?
+    // Resolve the client auth keypair: exactly one of the inline secret (CLI
+    // only) or the key file. The builder already rejected both at once.
+    let client_key = if let Some(ref secret) = resolved.auth_key {
+        auth::ClientKey::from_secret_str(secret.trim()).context("Invalid client secret key")?
+    } else if let Some(ref path) = resolved.auth_key_file {
+        auth::load_client_key_from_file(path).context("Failed to load the client key file")?
     } else {
         anyhow::bail!(
-            "VPN client requires an authentication token.\n\
-             Use --auth-token <TOKEN> or --auth-token-file <FILE>"
+            "VPN client requires an authentication keypair.\n\
+             Generate one with: flexaccess-keys generate-auth-key -o <FILE>\n\
+             Then pass --auth-key-file <FILE> (or --auth-key <SECRET>), or set \
+             auth_key_file in the config, and put the key's public half \
+             (`flexaccess-keys show-auth-key --private-key-file <FILE>`) on the \
+             server's authorized_keys_file."
         );
     };
+
+    // The public half is what the operator puts on the server's
+    // authorized-keys file — never a secret, so log it plainly.
+    log::info!("Client auth public key: {}", client_key.public_str());
 
     // Parse IPv4 routes (optional - the server's VPN address is always routed by default)
     let parsed_routes: Vec<Ipv4Net> = resolved
@@ -1037,7 +1026,7 @@ async fn run_vpn_client(
     // Create VPN client config
     let config = VpnClientConfig {
         server_node_id: resolved.server_node_id.clone(),
-        auth_token: Some(token),
+        client_key,
         routes: parsed_routes,
         routes6: parsed_routes6,
     };
