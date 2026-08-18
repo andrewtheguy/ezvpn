@@ -47,6 +47,7 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use rand::RngExt;
 
+use crate::auth::ClientKey;
 use crate::config::VPN_MTU;
 use crate::error::{VpnError, VpnResult};
 use crate::net::device::TunDevice;
@@ -57,12 +58,13 @@ use crate::tunnel::client::{
 };
 
 /// Connection parameters supplied by the iOS app (built from the FFI JSON).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct IosConfig {
     /// Server's iroh endpoint id (node id), as a string.
     pub server_node_id: String,
-    /// Optional ezvpn auth token.
-    pub auth_token: Option<String>,
+    /// Client authentication keypair; its public half must be on the server's
+    /// authorized-keys file.
+    pub client_key: ClientKey,
     /// Relay configuration (custom relays double as dial hints).
     pub relay_config: RelayConfig,
     /// IPv4 prefixes routed through the tunnel (the split-tunnel `includedRoutes`).
@@ -145,7 +147,7 @@ impl IosSession {
         // allocation by (endpoint id, device id).
         let device_id: u64 = rand::rng().random();
         let (server_info, data_send, data_recv) =
-            perform_handshake(&connection, device_id, cfg.auth_token.as_deref()).await?;
+            perform_handshake(&connection, device_id, &cfg.client_key, endpoint.id()).await?;
 
         // `perform_handshake` already guarantees at least one family was
         // assigned, so IPv4-only, IPv6-only, and dual-stack all pass here.

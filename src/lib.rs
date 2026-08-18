@@ -1,7 +1,8 @@
 //! ezvpn
 //!
 //! IP-over-QUIC VPN tunnel via iroh P2P connections.
-//! Uses ezvpn auth tokens for access control and TLS 1.3/QUIC for encryption.
+//! Uses ed25519 client keypairs for access control and TLS 1.3/QUIC for
+//! encryption.
 //!
 //! This is the library crate. The desktop CLI (`src/main.rs`) and the Apple
 //! Network Extension FFI (`src/ffi.rs`, built into a `staticlib`) both consume
@@ -19,6 +20,10 @@
 )))]
 compile_error!("ezvpn only supports Linux, macOS, Windows, and iOS");
 
+// Re-exported so downstream consumers (the FFI layers, the CLI) can name the
+// shared key types without depending on the git crate themselves.
+pub use flexaccess_keys;
+
 pub mod auth;
 pub mod config;
 pub mod error;
@@ -34,6 +39,10 @@ pub mod tunnel;
 pub mod control;
 #[cfg(not(target_os = "ios"))]
 pub mod runtime;
+
+// Key helpers shared by the two (target-disjoint) FFI surfaces below. Built
+// everywhere so the desktop test run covers it.
+pub mod ffi_common;
 
 // Apple Network Extension C FFI surface consumed by the iOS/macOS app extension.
 #[cfg(any(target_os = "ios", target_os = "macos"))]

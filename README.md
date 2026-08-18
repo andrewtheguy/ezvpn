@@ -57,7 +57,11 @@ underlay path to the server and relay infrastructure outside the VPN route.
 - Full subnet routing, not just single-port forwarding
 - End-to-end encryption via QUIC/TLS 1.3 through iroh
 - NAT traversal with relay fallback
-- Token-based authentication over iroh's cryptographic endpoint identity
+- Public-key (ed25519) client authentication over iroh's cryptographic
+  endpoint identity, in the shared
+  [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) format
+  (`flexaccess-keys generate-auth-key`); the server keeps the public keys in an
+  ssh-`authorized_keys`-style file
 - Optional dual-stack VPN operation with IPv4, IPv6, or both
 - Optional split tunneling through repeatable `--route` and `--route6`
 - Auto-reconnect using QUIC keep-alive and idle-timeout health checks
@@ -186,28 +190,47 @@ cargo build --release
 
 ## Quick Start
 
-### 1. Generate Server Identity and Tokens
+### 1. Generate Server Identity and Client Keys
+
+The server identity key is an `ezvpn` command:
 
 ```bash
 ezvpn generate-server-key --output ./vpn-server.key
-
-AUTH_TOKEN=$(ezvpn generate-auth-token)
-echo "$AUTH_TOKEN"
 ```
 
-Token format:
+Client authentication keypairs are managed by the standalone
+[`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys) CLI;
+install it once (`curl -sSL https://flexaccessdev.github.io/flexaccess-keys/install.sh | bash`,
+Windows: `irm https://flexaccessdev.github.io/flexaccess-keys/install.ps1 | iex`),
+then, **on each client**:
 
-- Auth token: exactly 47 characters, `v` followed by 46 Base64URL characters
-  with no padding.
+```bash
+flexaccess-keys generate-auth-key "alice laptop" -o client.key
+flexaccess-keys show-auth-key --private-key-file client.key
+```
 
-`generate-server-key`, `generate-auth-token`, and `show-server-id` all accept
-`--json` for machine-readable output.
+The first command writes the client's secret key file; the second prints its
+public authorized-key entry (`ed25519-pub:… alice laptop`), which the client
+hands to the server operator. Secret keys never leave the client.
 
-The auth token identifies authorized clients. The tunnel also negotiates a
+`generate-server-key` and `show-server-id` accept `--json` for machine-readable
+output.
+
+The client keypair identifies authorized clients. The tunnel also negotiates a
 fixed ALPN over iroh's QUIC handshake, so a peer that does not speak the ezvpn
 protocol is rejected before any stream is opened.
 
 ### 2. Create Server Config
+
+Collect the clients' public entries into an `authorized_keys` file, ssh
+`authorized_keys` style — one `ed25519-pub:…` per line, optional trailing
+comment; `#` lines and blank lines ignored:
+
+```text
+# ./authorized_keys
+ed25519-pub:AAAA...  alice laptop
+ed25519-pub:BBBB...  build server
+```
 
 Create `vpn_server.toml`, or copy from `vpn_server.toml.example`:
 
@@ -218,7 +241,7 @@ role = "vpnserver"
 network = "10.0.0.0/24"
 
 [auth]
-auth_tokens = ["<YOUR_AUTH_TOKEN>"]
+authorized_keys_file = "./authorized_keys"
 
 [iroh]
 secret_file = "./vpn-server.key"
@@ -228,7 +251,7 @@ Config notes:
 
 - `[network]` defines VPN addressing. At least one of `network` (IPv4) or
   `network6` (IPv6) is required.
-- `[auth]` defines accepted client auth tokens.
+- `[auth]` points at the file of authorized client public keys (required).
 - `[iroh]` defines server identity and relay/discovery settings.
 - There are no performance or security knobs: MTU, QUIC transport settings,
   and queue sizes are fixed constants, and spoofing checks are always
@@ -254,7 +277,7 @@ ezvpn show-server-id --secret-file ./vpn-server.key
 ```bash
 sudo ezvpn client start \
   --server-node-id <SERVER_ENDPOINT_ID> \
-  --auth-token "$AUTH_TOKEN"
+  --auth-key-file ./client.key
 ```
 
 ### 5. Verify Connectivity
@@ -287,7 +310,7 @@ same values from constants. The one exception is congestion control, which
 CLI-only testing flags can change on the local sender (see
 [Throughput Notes](#throughput-notes)).
 
-Clients configure their server identity, auth token, routes, relay and
+Clients configure their server identity, auth keypair, routes, relay and
 discovery settings, and reconnect behavior. Client CLI arguments take
 precedence over client config file values.
 
@@ -320,8 +343,8 @@ machine-readable output.
 | `-c, --config <FILE>` | Client config path |
 | `--default-config` | Use `vpn_client.toml` in the system config dir (`/etc/ezvpn` on Linux, `/usr/local/etc/ezvpn` on macOS, `%ProgramData%\ezvpn` on Windows) |
 | `-n, --server-node-id <ID>` | VPN server `EndpointId` |
-| `--auth-token <TOKEN>` | Authentication token |
-| `--auth-token-file <PATH>` | Read auth token from file |
+| `--auth-key <SECRET>` | Inline client secret key (`ed25519-sec:…`). Prefer the key file — an inline secret is visible in the process list |
+| `--auth-key-file <PATH>` | Client key file from `flexaccess-keys generate-auth-key` |
 | `--route <CIDR>` | Additional IPv4 route through the VPN; repeatable |
 | `--route6 <CIDR>` | Additional IPv6 route through the VPN; repeatable |
 | `--relay-url <URL>` | Custom relay URL; repeatable |
@@ -430,7 +453,7 @@ Split tunnel example:
 ```bash
 sudo ezvpn client start \
   --server-node-id <SERVER_ENDPOINT_ID> \
-  --auth-token "$AUTH_TOKEN" \
+  --auth-key-file ./client.key \
   --route 192.168.1.0/24 \
   --route 172.16.0.0/12
 ```
@@ -440,7 +463,7 @@ Full tunnel example:
 ```bash
 sudo ezvpn client start \
   --server-node-id <SERVER_ENDPOINT_ID> \
-  --auth-token "$AUTH_TOKEN" \
+  --auth-key-file ./client.key \
   --route 0.0.0.0/0 \
   --route6 ::/0
 ```
@@ -773,3 +796,11 @@ core, the C interface, and build steps.
 
 Detailed internals, flow diagrams, client isolation rules, and reconnect
 consistency checks live in [`docs/Architecture.md`](docs/Architecture.md).
+
+## Related Projects
+
+- [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) — the
+  shared FlexAccess authentication key format and its `generate-auth-key` /
+  `show-auth-key` CLI, where all `ezvpn` client key generation happens. `ezvpn`
+  links against the library only to parse, sign, and verify; that repo is
+  authoritative for the token format and file parsing rules.

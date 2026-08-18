@@ -20,7 +20,9 @@
 //! ## Config JSON (input to `ezvpn_connect`)
 //!
 //! `routes`/`routes6` are the split-tunnel prefixes; they drive the
-//! overlapping-server-address bypass. `auth_token` may be null; `relay_urls`,
+//! overlapping-server-address bypass. `auth_key` (the client's
+//! `ed25519-sec:...` secret key, whose public half must be on the server's
+//! authorized-keys file) and `server_node_id` are required; `relay_urls`,
 //! `relay_auth_token`, `routes`, and `routes6` are all optional.
 //! `relay_auth_token` is the shared bearer token for the custom relays (sent as
 //! `Authorization: Bearer <token>`); it is only valid together with
@@ -29,7 +31,7 @@
 //! ```json
 //! {
 //!   "server_node_id": "<iroh endpoint id>",
-//!   "auth_token": "<optional ezvpn auth token>",
+//!   "auth_key": "ed25519-sec:...",
 //!   "relay_urls": ["https://relay.example/"],
 //!   "relay_auth_token": "<optional shared relay bearer token>",
 //!   "routes": ["10.0.0.0/8"],
@@ -90,8 +92,9 @@ pub struct EzvpnHandle {
 #[derive(Deserialize)]
 struct FfiConfig {
     server_node_id: String,
-    #[serde(default)]
-    auth_token: Option<String>,
+    /// The client's secret key (`ed25519-sec:...`); the app stores it in the
+    /// iOS keychain and passes it here at start.
+    auth_key: String,
     #[serde(default)]
     relay_urls: Vec<String>,
     /// Optional shared bearer token for the custom relays. Only valid with
@@ -131,6 +134,79 @@ pub extern "C" fn ezvpn_init_logging() {
         env_logger::Env::default().default_filter_or("info,iroh=warn,tracing=warn"),
     )
     .try_init();
+}
+
+/// Generate a fresh client authentication keypair. Writes
+/// `{"created":"<UTC>","public_key":"ed25519-pub:...","secret_key":"ed25519-sec:..."}`
+/// to `out_buf`. The app stores the secret key in the keychain and shows the
+/// public key (never a secret) for the user to put on the server's
+/// authorized-keys file.
+///
+/// Returns 1 on success, 0 if `out_buf` is too small or key generation failed
+/// (the system RNG was unavailable). On the too-small return `out_buf` holds a
+/// **truncated prefix of the document, secret-key material included**, so the
+/// caller should zero the buffer before retrying with a larger one.
+///
+/// # Safety
+/// `out_buf` must point to at least `out_len` writable bytes (may be null only
+/// if `out_len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ezvpn_generate_client_key(out_buf: *mut c_char, out_len: usize) -> c_int {
+    match crate::ffi_common::generate_client_key_json() {
+        Ok(json) => {
+            if write_cstr(out_buf, out_len, &json) {
+                1
+            } else {
+                0
+            }
+        }
+        Err(msg) => {
+            write_cstr(out_buf, out_len, &msg);
+            0
+        }
+    }
+}
+
+/// Derive the public key (`ed25519-pub:...`) of a stored secret key, so the app
+/// can display it unmasked without persisting it separately. Writes the public
+/// key string to `out_buf` on success (returns 1), or an error message
+/// (returns 0) for an invalid secret. A too-small `out_buf` also returns 0, but
+/// then holds the truncated output rather than a diagnostic.
+///
+/// # Safety
+/// - `secret_key` must be a valid, NUL-terminated UTF-8 C string.
+/// - `out_buf` must point to at least `out_len` writable bytes (may be null only
+///   if `out_len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ezvpn_client_public_key(
+    secret_key: *const c_char,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    if secret_key.is_null() {
+        write_cstr(out_buf, out_len, "secret_key is null");
+        return 0;
+    }
+    let secret = match unsafe { CStr::from_ptr(secret_key) }.to_str() {
+        Ok(secret) => secret,
+        Err(_) => {
+            write_cstr(out_buf, out_len, "secret_key is not valid UTF-8");
+            return 0;
+        }
+    };
+    match crate::ffi_common::client_public_key(secret) {
+        Ok(public) => {
+            if write_cstr(out_buf, out_len, &public) {
+                1
+            } else {
+                0
+            }
+        }
+        Err(msg) => {
+            write_cstr(out_buf, out_len, &msg);
+            0
+        }
+    }
 }
 
 /// Connect to the server and perform the handshake.
@@ -190,9 +266,11 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
 
     let relay_config = RelayConfig::from_urls_with_token(&cfg.relay_urls, cfg.relay_auth_token)
         .map_err(|e| format!("{e:#}"))?;
+    let client_key = crate::auth::ClientKey::from_secret_str(cfg.auth_key.trim())
+        .map_err(|e| format!("invalid auth key: {e:#}"))?;
     let ios_config = IosConfig {
         server_node_id: cfg.server_node_id,
-        auth_token: cfg.auth_token,
+        client_key,
         relay_config: relay_config.clone(),
         routes: parse_routes::<Ipv4Net>(&cfg.routes, "IPv4 route")?,
         routes6: parse_routes::<Ipv6Net>(&cfg.routes6, "IPv6 route")?,

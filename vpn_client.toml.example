@@ -11,7 +11,7 @@
 #
 # Config is grouped by purpose:
 #   [network] - VPN routes to install once connected
-#   [auth]    - the auth token presented to the server
+#   [auth]    - the client keypair presented to the server
 #   top-level - client runtime behavior (reconnection)
 #   [iroh]    - iroh transport: server identity, ALPN, relays, address lookup
 
@@ -37,16 +37,18 @@ role = "vpnclient"
 # ============================================================================
 # Authentication (REQUIRED)
 # ============================================================================
-# Token provided by the server admin for authentication
-# Token format: exactly 47 characters (`v` + 46 Base64URL chars, no padding)
-# Generate with: ezvpn generate-auth-token
-
-# NOTE: Use either auth_token OR auth_token_file, not both.
-auth_token = "<YOUR_AUTH_TOKEN>"  # Replace with real token from generate-auth-token
-
-# Or use a file containing the token (one token, # comments allowed)
-# NOTE: Use either auth_token OR auth_token_file, not both.
-# auth_token_file = "/etc/ezvpn/vpn-token.txt"  # %ProgramData%\ezvpn\... on Windows
+# The client authenticates with an ed25519 keypair it generates itself. Give the
+# server operator the key's public half; they put it on the server's
+# authorized_keys_file.
+#
+# Key management lives in the standalone flexaccess-keys CLI
+# (https://github.com/flexaccessdev/flexaccess-keys):
+#   flexaccess-keys generate-auth-key "alice laptop" -o client.key
+#   flexaccess-keys show-auth-key --private-key-file client.key   # public entry
+#
+# A config file can only point at the key file; there is no inline-secret key
+# here (the CLI's --auth-key <SECRET> is the only inline route).
+auth_key_file = "/etc/ezvpn/client.key"  # %ProgramData%\ezvpn\... on Windows
 
 [network]
 # ============================================================================
