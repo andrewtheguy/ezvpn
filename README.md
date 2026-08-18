@@ -800,7 +800,7 @@ consistency checks live in [`docs/Architecture.md`](docs/Architecture.md).
 ## Related Projects
 
 - [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) — the
-  shared FlexAccess authentication key format (`ed25519-sec:` / `ed25519-pub:`
-  tokens, key files, authorized-keys parsing) and the `generate-auth-key` /
-  `show-auth-key` CLI. `ezvpn` links against it to parse, sign, and verify;
-  key generation lives entirely in that CLI.
+  shared FlexAccess authentication key format and its `generate-auth-key` /
+  `show-auth-key` CLI, where all `ezvpn` client key generation happens. `ezvpn`
+  links against the library only to parse, sign, and verify; that repo is
+  authoritative for the token format and file parsing rules.

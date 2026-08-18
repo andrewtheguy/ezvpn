@@ -350,6 +350,14 @@ impl ResolvedVpnServerConfig {
             );
         }
 
+        if auth.authorized_keys_file.is_none() {
+            anyhow::bail!(
+                "[auth] 'authorized_keys_file' is required. Each client generates a keypair \
+                 with: flexaccess-keys generate-auth-key -o <FILE>, then puts its \
+                 authorized-key entry (one 'ed25519-pub:...' per line) in that file."
+            );
+        }
+
         validate_vpn_networks(
             net.network.as_deref(),
             net.server_ip.as_deref(),
@@ -701,6 +709,24 @@ relay_auth_token = "shared-secret"
         );
     }
 
+    /// Resolution enforces the authorized-keys file itself, like `secret_file`:
+    /// `from_config` is reachable without `validate()` (FFI/embedders), and a
+    /// server with no key source must never come up.
+    #[test]
+    fn test_server_missing_authorized_keys_file_rejected() {
+        let toml_str = server_toml("").replace(
+            "[auth]\nauthorized_keys_file = \"./authorized_keys\"\n",
+            "",
+        );
+        let config: VpnServerConfig = toml::from_str(&toml_str).unwrap();
+        let err = ResolvedVpnServerConfig::from_config(&config)
+            .expect_err("missing authorized_keys_file must be rejected");
+        assert!(
+            err.to_string().contains("authorized_keys_file"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn test_server_relay_auth_token_without_relays_rejected() {
         let config: VpnServerConfig = toml::from_str(
@@ -709,6 +735,9 @@ role = "vpnserver"
 
 [network]
 network6 = "fd00::/64"
+
+[auth]
+authorized_keys_file = "./authorized_keys"
 
 [iroh]
 secret_file = "./vpn-server.key"

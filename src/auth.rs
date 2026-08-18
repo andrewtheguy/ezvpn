@@ -58,11 +58,14 @@ impl From<PrivateKey> for ClientKey {
 }
 
 impl ClientKey {
-    /// Generate a fresh random keypair.
-    pub fn generate() -> Self {
-        PrivateKey::generate()
-            .expect("system RNG unavailable")
-            .into()
+    /// Generate a fresh random keypair. Fails only when the system RNG is
+    /// unavailable — fallible rather than panicking because the FFI surfaces
+    /// call this, and a panic there aborts the host app process.
+    pub fn generate() -> Result<Self> {
+        let private = PrivateKey::generate()
+            .map_err(anyhow::Error::from)
+            .context("Failed to generate an authentication keypair")?;
+        Ok(private.into())
     }
 
     /// Parse an encoded secret key (`ed25519-sec:...`).
@@ -146,7 +149,7 @@ mod tests {
 
     #[test]
     fn keypair_roundtrip() {
-        let key = ClientKey::generate();
+        let key = ClientKey::generate().unwrap();
         let secret = key.secret_str();
         assert!(secret.starts_with(PRIVATE_KEY_PREFIX));
         let public = key.public_str();
@@ -160,7 +163,7 @@ mod tests {
     #[test]
     fn secret_str_rejects_bad_inputs() {
         // Wrong prefix (a public key is not a secret key).
-        let key = ClientKey::generate();
+        let key = ClientKey::generate().unwrap();
         assert!(ClientKey::from_secret_str(&key.public_str()).is_err());
         // Bad base64.
         assert!(ClientKey::from_secret_str("ed25519-sec:!!!").is_err());
@@ -175,7 +178,7 @@ mod tests {
 
     #[test]
     fn shared_key_file_reloads() {
-        let key = ClientKey::generate();
+        let key = ClientKey::generate().unwrap();
         let contents = format!(
             "# Ed25519 authentication key\n# Public key: {} alice laptop\n{}\n",
             key.public_str(),
@@ -200,7 +203,7 @@ mod tests {
 
     #[test]
     fn signature_binds_endpoint_id() {
-        let key = ClientKey::generate();
+        let key = ClientKey::generate().unwrap();
         let id = ephemeral_endpoint_id();
         let sig = key.sign_endpoint_id(&id);
         assert!(verify_endpoint_id_signature(&key.public_key(), &id, &sig));
@@ -214,7 +217,7 @@ mod tests {
         ));
 
         // A different key fails.
-        let other_key = ClientKey::generate();
+        let other_key = ClientKey::generate().unwrap();
         assert!(!verify_endpoint_id_signature(
             &other_key.public_key(),
             &id,
@@ -228,9 +231,9 @@ mod tests {
 
     #[test]
     fn authorized_keys_parsing() {
-        let a = ClientKey::generate();
-        let b = ClientKey::generate();
-        let c = ClientKey::generate();
+        let a = ClientKey::generate().unwrap();
+        let b = ClientKey::generate().unwrap();
+        let c = ClientKey::generate().unwrap();
 
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "# Authorized client keys").unwrap();
@@ -257,7 +260,7 @@ mod tests {
 
         // A secret key pasted into the authorized-keys file is rejected too.
         let mut wrong = NamedTempFile::new().unwrap();
-        writeln!(wrong, "{}", ClientKey::generate().secret_str()).unwrap();
+        writeln!(wrong, "{}", ClientKey::generate().unwrap().secret_str()).unwrap();
         assert!(load_authorized_keys(wrong.path()).is_err());
     }
 }

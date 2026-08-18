@@ -52,7 +52,11 @@ void ezvpn_init_logging(void);
  *   public key (never a secret) so the user can put it on the server's
  *   authorized_keys file.
  *
- * Returns 1 on success, 0 if out_buf is too small.
+ * Returns 1 on success, 0 if out_buf is too small or key generation failed
+ * (system RNG unavailable, in which case out_buf holds the error message).
+ * On the too-small return out_buf holds a TRUNCATED PREFIX OF THE DOCUMENT,
+ * secret-key material included — zero the buffer before retrying with a larger
+ * one so no partial secret is left in memory.
  */
 int ezvpn_generate_client_key(char *out_buf, size_t out_len);
 
@@ -74,13 +78,16 @@ int ezvpn_client_public_key(const char *secret_key, char *out_buf, size_t out_le
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
  *   {"server_node_id":"<id>","auth_key":"ed25519-sec:...",
- *    "relay_urls":[],
+ *    "relay_urls":[],"relay_auth_token":null,
  *    "routes":["10.0.0.0/8"],"routes6":["fd00::/8"],
  *    "instance":"default","auto_reconnect":true,"max_reconnect_attempts":null}
  *   auth_key is the client's ed25519 secret key; its public half must be on
  *   the server's authorized_keys file. It and server_node_id are required;
- *   max_reconnect_attempts may be null. relay_urls, routes, routes6, instance,
- *   and auto_reconnect are optional.
+ *   max_reconnect_attempts may be null. relay_urls, relay_auth_token, routes,
+ *   routes6, instance, and auto_reconnect are optional.
+ *   relay_auth_token is the shared bearer token sent to the custom relays as
+ *   "Authorization: Bearer <token>"; it is valid ONLY together with relay_urls
+ *   and is rejected with the default relays.
  *   routes/routes6 are the split-tunnel prefixes routed through the tunnel; the
  *   server's advertised gateway host prefix is always routed in addition.
  * out_buf/out_len : caller buffer. On failure receives the error message

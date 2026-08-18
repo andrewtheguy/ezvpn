@@ -232,7 +232,7 @@ mod tests {
     fn minimal_client_config(server_node_id: String) -> VpnClientConfig {
         VpnClientConfig {
             server_node_id,
-            client_key: ClientKey::generate(),
+            client_key: ClientKey::generate().unwrap(),
             routes: vec![],
             routes6: vec![],
         }

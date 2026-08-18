@@ -40,6 +40,10 @@ pub mod control;
 #[cfg(not(target_os = "ios"))]
 pub mod runtime;
 
+// Key helpers shared by the two (target-disjoint) FFI surfaces below. Built
+// everywhere so the desktop test run covers it.
+pub mod ffi_common;
+
 // Apple Network Extension C FFI surface consumed by the iOS/macOS app extension.
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 pub mod ffi;

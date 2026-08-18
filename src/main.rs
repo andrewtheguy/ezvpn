@@ -863,6 +863,15 @@ async fn show_list(role: LockRole, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Shown when the server has no client keys to authorize against — either no
+/// `authorized_keys_file` was configured, or the configured file held none.
+const NO_AUTHORIZED_KEYS_HELP: &str =
+    "VPN server requires at least one authorized client public key.\n\
+     Each client generates a keypair with: flexaccess-keys generate-auth-key -o <FILE>\n\
+     Put each key's authorized-key entry (one `ed25519-pub:...` per line, from \
+     `flexaccess-keys show-auth-key --private-key-file <FILE>`) in a file and set \
+     authorized_keys_file in the config.";
+
 /// Run VPN server.
 async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
     // Parse IPv4 network CIDR (optional, for IPv6-only servers)
@@ -902,17 +911,11 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         Some(path) => {
             auth::load_authorized_keys(path).context("Failed to load the authorized client keys")?
         }
-        None => Default::default(),
+        None => anyhow::bail!(NO_AUTHORIZED_KEYS_HELP),
     };
 
     if authorized_keys.is_empty() {
-        anyhow::bail!(
-            "VPN server requires at least one authorized client public key.\n\
-             Each client generates a keypair with: flexaccess-keys generate-auth-key -o <FILE>\n\
-             Put each key's authorized-key entry (one `ed25519-pub:...` per line, from \
-             `flexaccess-keys show-auth-key --private-key-file <FILE>`) in a file and set \
-             authorized_keys_file in the config."
-        );
+        anyhow::bail!(NO_AUTHORIZED_KEYS_HELP);
     }
 
     log::info!("Loaded {} authorized client key(s)", authorized_keys.len());

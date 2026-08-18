@@ -157,22 +157,31 @@ pub extern "C" fn ezvpn_init_logging() {
 /// Generate a fresh client authentication keypair. Writes
 /// `{"created":"<UTC>","public_key":"ed25519-pub:...","secret_key":"ed25519-sec:..."}`
 /// to `out_buf`. The GUI stores the secret key and shows the public key (never a
-/// secret) for the user to put on the server's authorized-keys file. Returns 1
-/// on success, 0 if `out_buf` is too small.
+/// secret) for the user to put on the server's authorized-keys file.
+///
+/// Returns 1 on success, 0 if `out_buf` is too small or key generation failed
+/// (the system RNG was unavailable). On the too-small return `out_buf` holds a
+/// **truncated prefix of the document, secret-key material included**, so the
+/// caller should zero the buffer before retrying with a larger one.
 ///
 /// # Safety
 /// `out_buf` must point to at least `out_len` writable bytes (may be null only
 /// if `out_len` is 0).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ezvpn_generate_client_key(out_buf: *mut c_char, out_len: usize) -> c_int {
-    let key = crate::auth::ClientKey::generate();
-    let json = serde_json::json!({
-        "created": crate::flexaccess_keys::rfc3339_utc(std::time::SystemTime::now()),
-        "public_key": key.public_str(),
-        "secret_key": key.secret_str(),
-    })
-    .to_string();
-    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+    match crate::ffi_common::generate_client_key_json() {
+        Ok(json) => {
+            if write_cstr(out_buf, out_len, &json) {
+                1
+            } else {
+                0
+            }
+        }
+        Err(msg) => {
+            write_cstr(out_buf, out_len, &msg);
+            0
+        }
+    }
 }
 
 /// Derive the public key (`ed25519-pub:...`) of a stored secret key, so the GUI
@@ -202,16 +211,16 @@ pub unsafe extern "C" fn ezvpn_client_public_key(
             return 0;
         }
     };
-    match crate::auth::ClientKey::from_secret_str(secret.trim()) {
-        Ok(key) => {
-            if write_cstr(out_buf, out_len, &key.public_str()) {
+    match crate::ffi_common::client_public_key(secret) {
+        Ok(public) => {
+            if write_cstr(out_buf, out_len, &public) {
                 1
             } else {
                 0
             }
         }
-        Err(e) => {
-            write_cstr(out_buf, out_len, &format!("invalid secret key: {e:#}"));
+        Err(msg) => {
+            write_cstr(out_buf, out_len, &msg);
             0
         }
     }
