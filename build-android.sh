@@ -34,8 +34,8 @@ set -euo pipefail
 
 PROFILE="${1:-release}"
 # arm64-v8a is every current phone and the arm64 Android VM used for
-# development/testing; armeabi-v7a covers 32-bit-only devices (e.g. the 2013
-# Nexus 7 that only gets the signed release APK); x86_64 is the stock emulator.
+# development/testing; armeabi-v7a covers 32-bit-only devices; x86_64 is the
+# stock emulator.
 ABIS="${ABIS:-arm64-v8a armeabi-v7a x86_64}"
 # Minimum Android API level the .so links against (must be <= the app's
 # minSdk). 29 = Android 10.

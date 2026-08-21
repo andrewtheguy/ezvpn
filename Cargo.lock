@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "ezvpn"
-version = "0.0.42"
+version = "0.0.43"
 dependencies = [
  "android_logger",
  "anyhow",
@@ -960,6 +960,7 @@ dependencies = [
  "toml",
  "tun",
  "url",
+ "webpki-roots",
  "windows-sys 0.61.2",
 ]
 
