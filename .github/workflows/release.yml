@@ -148,9 +148,9 @@ jobs:
         # one libezvpn.so per ABI with the runner's preinstalled NDK, and stages
         # dist/android/jniLibs + libezvpn-android.zip. That zip becomes the
         # release asset the Android app's Gradle build downloads by default.
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
-        run: ./build-android.sh release
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:?runner image has no Android NDK}"
+          ./build-android.sh release
       - uses: actions/upload-artifact@v4
         with:
           name: release-android

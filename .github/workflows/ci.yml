@@ -55,15 +55,14 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
       - name: Clippy (arm64-v8a)
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
         run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:?runner image has no Android NDK}"
           rustup target add aarch64-linux-android
           cargo ndk -t arm64-v8a --platform 29 clippy --lib -- -D warnings
       - name: Build libezvpn.so (debug)
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
-        run: ABIS="arm64-v8a armeabi-v7a x86_64" ./build-android.sh debug
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:?runner image has no Android NDK}"
+          ABIS="arm64-v8a armeabi-v7a x86_64" ./build-android.sh debug
 
   # The host clippy compiles the Windows-gated module (src/ffi_windows.rs).
   windows:
