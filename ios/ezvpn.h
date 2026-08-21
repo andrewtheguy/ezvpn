@@ -76,6 +76,9 @@ int ezvpn_client_public_key(const char *secret_key, char *out_buf, size_t out_le
  *   auth_key is the client's ed25519 secret key; its public half must be on
  *   the server's authorized_keys file. It and server_node_id are required;
  *   relay_urls, relay_auth_token, routes, and routes6 are optional.
+ *   An optional "dns_proxy" object is accepted only by the Android build (the
+ *   in-tunnel split-DNS forwarder, see docs/Android-App.md); Apple callers
+ *   must not send it.
  *   relay_auth_token is the shared bearer token sent to the custom relays as
  *   "Authorization: Bearer <token>"; it is valid ONLY together with relay_urls
  *   and is rejected with the default relays.

@@ -1,19 +1,23 @@
-//! Slim iOS connect path.
+//! Slim mobile connect path (iOS/macOS Network Extension, Android VpnService).
 //!
-//! iOS VPNs run inside a `NEPacketTunnelProvider` app extension. Unlike the
-//! desktop [`crate::tunnel::client::VpnClient`], this path:
+//! Mobile VPNs run inside an OS-managed container — a `NEPacketTunnelProvider`
+//! app extension on Apple platforms, a `VpnService` on Android — that owns the
+//! tunnel interface. Unlike the desktop [`crate::tunnel::client::VpnClient`],
+//! this path:
 //!
-//! - does **not** create a `utun` or configure routes/IP/MTU — the extension
-//!   owns that via `NEPacketTunnelNetworkSettings`, then hands us the tunnel's
-//!   `utun` fd;
-//! - does **not** install OS bypass routes itself. Instead [`IosSession::connect`]
+//! - does **not** create a tun device or configure routes/IP/MTU — the
+//!   extension owns that via `NEPacketTunnelNetworkSettings` (the Android
+//!   service via `VpnService.Builder`), then hands us the tunnel's fd;
+//! - does **not** install OS bypass routes itself. Instead [`MobileSession::connect`]
 //!   computes the underlay-bypass set the desktop `BypassRouteManager` would pin
 //!   (every relay IP plus the server's handshake-advertised candidate underlay
 //!   addresses, filtered to the **global-scope** ones a routed prefix would
 //!   capture — including the server's advertised host prefix, which the
-//!   extension always routes) and [`IosSession::network_config`] returns them as
+//!   extension always routes) and [`MobileSession::network_config`] returns them as
 //!   host routes (`/32` / `/128`) for the extension to apply as
-//!   `excludedRoutes`. Private-scope server addresses (RFC1918/ULA/link-local)
+//!   `excludedRoutes` (Android, which has no exclude API before 13, subtracts
+//!   them from the routed prefixes instead). Private-scope server addresses
+//!   (RFC1918/ULA/link-local)
 //!   are never bypassed: the app refuses to start when a routed prefix overlaps
 //!   the local network, so they are unreachable off-tunnel in any session that
 //!   starts, and bypassing them would blackhole tunnel destinations sharing the
@@ -30,12 +34,12 @@
 //!
 //! The flow is two-phase because the extension needs the server-assigned
 //! addresses (IPv4 and/or IPv6), MTU, and excluded routes to build its network
-//! settings *before* it can produce the `utun` fd:
+//! settings *before* it can produce the tun fd:
 //!
-//! 1. [`IosSession::connect`] — create an iroh endpoint, connect, handshake.
-//! 2. read [`IosSession::network_config`], apply it as
-//!    `NEPacketTunnelNetworkSettings`, obtain the `utun` fd.
-//! 3. [`IosSession::run`] — drive the tunnel over that fd until it ends.
+//! 1. [`MobileSession::connect`] — create an iroh endpoint, connect, handshake.
+//! 2. read [`MobileSession::network_config`], apply it as
+//!    `NEPacketTunnelNetworkSettings` / `VpnService.Builder`, obtain the fd.
+//! 3. [`MobileSession::run`] — drive the tunnel over that fd until it ends.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -52,14 +56,15 @@ use crate::config::VPN_MTU;
 use crate::error::{VpnError, VpnResult};
 use crate::net::device::TunDevice;
 use crate::transport::endpoint::{RelayConfig, connect_with_timeout, create_client_endpoint};
+use crate::tunnel::dns_proxy::DnsProxyConfig;
 use crate::tunnel::client::{
     ServerInfo, collect_local_iroh_udp_ports, collect_relay_ips, overlapping_underlay_excludes,
     perform_handshake, run_tunnel,
 };
 
-/// Connection parameters supplied by the iOS app (built from the FFI JSON).
-#[derive(Debug, Clone)]
-pub struct IosConfig {
+/// Connection parameters supplied by the mobile app (built from the FFI JSON).
+#[derive(Debug)]
+pub struct MobileConfig {
     /// Server's iroh endpoint id (node id), as a string.
     pub server_node_id: String,
     /// Client authentication keypair; its public half must be on the server's
@@ -73,14 +78,18 @@ pub struct IosConfig {
     pub routes: Vec<Ipv4Net>,
     /// IPv6 prefixes routed through the tunnel.
     pub routes6: Vec<Ipv6Net>,
+    /// Android only: the in-tunnel split-DNS forwarder (see
+    /// [`crate::tunnel::dns_proxy`]). `None` everywhere else.
+    pub dns_proxy: Option<DnsProxyConfig>,
 }
 
-/// The network parameters the extension needs for `NEPacketTunnelNetworkSettings`.
+/// The network parameters the extension (or VpnService) needs to configure the
+/// tunnel interface.
 ///
 /// Each family is optional, mirroring the server's assignment: IPv4-only,
 /// IPv6-only, or dual-stack.
 #[derive(Debug, Clone)]
-pub struct IosNetworkConfig {
+pub struct MobileNetworkConfig {
     /// Assigned client VPN IPv4 address.
     pub assigned_ip: Option<Ipv4Addr>,
     /// Netmask for the assigned IPv4 address. Always the host mask
@@ -105,8 +114,8 @@ pub struct IosNetworkConfig {
     pub excluded_routes6: Vec<String>,
 }
 
-/// A connected, handshaked-but-not-yet-running iOS tunnel session.
-pub struct IosSession {
+/// A connected, handshaked-but-not-yet-running mobile tunnel session.
+pub struct MobileSession {
     endpoint: Endpoint,
     connection: Connection,
     /// Send half of the data stream (the handshake bi-stream, kept open).
@@ -119,14 +128,16 @@ pub struct IosSession {
     excluded_routes: Vec<String>,
     /// IPv6 underlay `/128`s overlapping a routed prefix.
     excluded_routes6: Vec<String>,
+    /// Forwarder configuration handed to `run_tunnel` by [`Self::run`].
+    dns_proxy: Option<DnsProxyConfig>,
 }
 
-impl IosSession {
+impl MobileSession {
     /// Create an iroh endpoint, connect to the server, and perform the
     /// handshake. The endpoint identity is ephemeral (a fresh key per session),
     /// so the server may assign a different IP on each connect — acceptable for
     /// the MVP.
-    pub async fn connect(cfg: &IosConfig) -> VpnResult<Self> {
+    pub async fn connect(cfg: MobileConfig) -> VpnResult<Self> {
         let endpoint = create_client_endpoint(&cfg.relay_config, None)
             .await
             .map_err(|e| VpnError::Signaling(format!("Failed to create iroh endpoint: {e}")))?;
@@ -186,7 +197,7 @@ impl IosSession {
         }
 
         log::info!(
-            "iOS handshake OK: ip={:?} net={:?} gw={:?} ip6={:?} net6={:?} gw6={:?} mtu={}",
+            "mobile handshake OK: ip={:?} net={:?} gw={:?} ip6={:?} net6={:?} gw6={:?} mtu={}",
             server_info.assigned_ip,
             server_info.network,
             server_info.server_ip,
@@ -204,6 +215,7 @@ impl IosSession {
             server_info,
             excluded_routes,
             excluded_routes6,
+            dns_proxy: cfg.dns_proxy,
         })
     }
 
@@ -220,9 +232,9 @@ impl IosSession {
 
     /// The network parameters for the extension's tunnel settings, for whichever
     /// families the server assigned (IPv4, IPv6, or both).
-    pub fn network_config(&self) -> VpnResult<IosNetworkConfig> {
+    pub fn network_config(&self) -> VpnResult<MobileNetworkConfig> {
         let info = &self.server_info;
-        Ok(IosNetworkConfig {
+        Ok(MobileNetworkConfig {
             assigned_ip: info.assigned_ip,
             netmask: info.network.map(|n| n.netmask()),
             gateway: info.server_ip,
@@ -235,7 +247,7 @@ impl IosSession {
         })
     }
 
-    /// Drive the tunnel over the extension-provided `utun` fd until it ends
+    /// Drive the tunnel over the OS-provided tun fd until it ends
     /// (peer close, idle timeout, or a fatal I/O error). Consumes the session.
     ///
     /// The two `run_tunnel` bypass hooks are `None`: the dynamic in-data-path
@@ -257,6 +269,7 @@ impl IosSession {
             None,
             None,
             local_iroh_udp_ports,
+            self.dns_proxy,
         )
         .await
     }

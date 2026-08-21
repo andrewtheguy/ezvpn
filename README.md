@@ -107,9 +107,10 @@ that bridges two sites with stable subnets, WireGuard is the right choice, not
 client do one thing — tunneling. Firewall, forwarding/NAT, and DNS
 configuration (e.g. conditional forwarding for an internal zone, see
 [docs/Client-Split-DNS.md](docs/Client-Split-DNS.md)) are expected to be
-managed outside the VPN connector. The iOS app is the one deliberate
-exception: it applies split DNS in-app (`NEDNSSettings`), because on iOS
-that is the only way to accomplish it.
+managed outside the VPN connector. The mobile apps are the deliberate
+exception: iOS applies split DNS in-app (`NEDNSSettings`) because that is the
+only way to accomplish it there, and Android forwards DNS in-tunnel because the
+platform has no per-domain DNS for VPNs at all.
 
 Also do not use `ezvpn` when the goal is anonymity. iroh's relays can see relay
 metadata when they are involved, even though the VPN payload remains encrypted.
@@ -622,9 +623,11 @@ Two things you do **not** need firewall rules for:
 On the client side, DNS is likewise managed outside the tunnel: to resolve an
 internal zone through a resolver reachable over the VPN, set OS-level
 conditional forwarding on each client — see
-[docs/Client-Split-DNS.md](docs/Client-Split-DNS.md). The exception is iOS,
-where the app applies DNS conditional forwarding in-tunnel itself (see
-[docs/Apple-App.md](docs/Apple-App.md)).
+[docs/Client-Split-DNS.md](docs/Client-Split-DNS.md). The exceptions are the
+mobile apps: iOS applies DNS conditional forwarding through `NEDNSSettings`
+(see [docs/Apple-App.md](docs/Apple-App.md)), and Android — which has no
+split-DNS API for VPNs — runs an in-tunnel forwarder in the Rust core (see
+[docs/Android-App.md](docs/Android-App.md)).
 
 ## Protocol, MTU, and GSO
 
@@ -777,6 +780,20 @@ Swift app consumes via a Swift package binary target.
 
 See [`docs/Apple-App.md`](docs/Apple-App.md) for scope, how it reuses the core, the C
 interface, and build steps.
+
+## Android App
+
+[`ezvpn-android`](https://github.com/flexaccessdev/ezvpn-android) is a native
+Kotlin/Compose client for Android that connects to an `ezvpn` server built from
+this repo (dual-stack split tunnel, optional tunnel DNS including split-DNS
+match domains via an in-tunnel forwarder, always-on support; no full tunnel or
+Play Store distribution). The tunnel runs in a `VpnService` that is handed the
+OS tun fd, like the Apple extension. The Rust core builds into one
+`libezvpn.so` per ABI here (`./build-android.sh`, released as
+`libezvpn-android.zip`), which the app loads through a small JNI surface.
+
+See [`docs/Android-App.md`](docs/Android-App.md) for scope, how it reuses the
+core, the JNI interface, the split-DNS forwarder, and build steps.
 
 ## Windows App
 

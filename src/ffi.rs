@@ -1,4 +1,6 @@
-//! C FFI surface for iOS and macOS Network Extension app extensions.
+//! C FFI surface for the fd-based mobile clients: the iOS and macOS Network
+//! Extension app extensions link it directly, and the Android JNI layer
+//! ([`crate::ffi_android`]) wraps the same handle and lifecycle.
 //!
 //! The extension links `libezvpn.a` and drives the tunnel in three calls:
 //!
@@ -6,7 +8,7 @@
 //!    connect, and handshake. Returns an opaque handle and writes the assigned
 //!    network config (IPv4 and/or IPv6, as JSON) to the caller's buffer so the
 //!    extension can build `NEPacketTunnelNetworkSettings`.
-//! 2. [`ezvpn_run`] — hand back the `utun` fd (obtained after applying the
+//! 2. [`ezvpn_run`] — hand back the tun fd (obtained after applying the
 //!    network settings); spawns the data-stream loop on the embedded runtime.
 //! 3. [`ezvpn_stop`] — abort the loop, close the endpoint, free the handle.
 //!
@@ -15,7 +17,7 @@
 //!
 //! All functions are null-safe and never unwind across the FFI boundary (the
 //! release profile is `panic = "abort"`, so a panic terminates the extension
-//! process rather than crossing into Swift).
+//! process rather than crossing into Swift/Kotlin).
 //!
 //! ## Config JSON (input to `ezvpn_connect`)
 //!
@@ -62,6 +64,7 @@
 //! ```
 
 use std::ffi::{CStr, c_char, c_int};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
 
@@ -71,14 +74,21 @@ use serde::Deserialize;
 use crate::error::VpnResult;
 use crate::transport::endpoint::RelayConfig;
 use crate::transport::paths::{ConnPathKind, connection_snapshot};
-use crate::tunnel::ios::{IosConfig, IosSession};
+use crate::tunnel::dns_proxy::DnsProxyConfig;
+use crate::tunnel::mobile::{MobileConfig, MobileSession};
 
-/// Opaque handle owned by the Swift side. Created by [`ezvpn_connect`], freed by
+/// Callback run on the embedded runtime when the data loop started by
+/// [`EzvpnHandle::run`] ends on its own (peer close, idle timeout, fatal I/O
+/// error). Not invoked when [`EzvpnHandle::stop`] aborts the loop — the caller
+/// initiated that and needs no notification.
+pub(crate) type ExitHook = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
+
+/// Opaque handle owned by the app side. Created by [`ezvpn_connect`], freed by
 /// [`ezvpn_stop`].
 pub struct EzvpnHandle {
     runtime: tokio::runtime::Runtime,
     /// The connected session, taken by [`ezvpn_run`].
-    session: Option<IosSession>,
+    session: Option<MobileSession>,
     /// The running tunnel task, present after [`ezvpn_run`].
     task: Option<tokio::task::JoinHandle<VpnResult<()>>>,
     /// Clone of the live iroh connection, kept so [`ezvpn_conn_path`] can
@@ -107,6 +117,93 @@ struct FfiConfig {
     /// IPv6 routed prefixes (CIDR strings).
     #[serde(default)]
     routes6: Vec<String>,
+    /// Android only: the in-tunnel split-DNS forwarder. Absent (or null) on
+    /// every other platform, which get conditional forwarding from the OS.
+    #[serde(default)]
+    dns_proxy: Option<FfiDnsProxy>,
+}
+
+/// The `dns_proxy` object of the config JSON (see [`crate::tunnel::dns_proxy`]).
+#[derive(Deserialize)]
+struct FfiDnsProxy {
+    /// Proxy IP literals the app points the VPN's DNS at (≤ 1 per family).
+    addresses: Vec<String>,
+    /// Domain suffixes resolved through the tunnel.
+    #[serde(default)]
+    match_domains: Vec<String>,
+    /// The tunnel's resolver IP literals (port 53).
+    servers: Vec<String>,
+    /// The underlying network's resolver IP literals (port 53); an IPv6
+    /// link-local one carries its scope as `fe80::1%<ifindex>`.
+    #[serde(default)]
+    fallback_servers: Vec<String>,
+    /// UDP socket fds the `VpnService` has `protect()`ed, at most one per
+    /// family, for the fallback upstreams. `dup`ed here; the app keeps and
+    /// closes its own.
+    #[serde(default)]
+    fallback_fds: Vec<i32>,
+}
+
+/// Parse a resolver literal with an optional `%<scope id>` suffix into a port-53
+/// socket address.
+fn parse_resolver(raw: &str) -> Result<SocketAddr, String> {
+    let (host, scope) = match raw.split_once('%') {
+        Some((h, s)) => (
+            h,
+            s.parse::<u32>()
+                .map_err(|_| format!("invalid resolver scope in {raw:?} (expected a numeric interface index)"))?,
+        ),
+        None => (raw, 0),
+    };
+    let ip: IpAddr = host
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid resolver address {raw:?}"))?;
+    Ok(match ip {
+        IpAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, crate::tunnel::dns_proxy::DNS_PORT)),
+        IpAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(v6, crate::tunnel::dns_proxy::DNS_PORT, 0, scope)),
+    })
+}
+
+fn parse_dns_proxy(raw: FfiDnsProxy) -> Result<DnsProxyConfig, String> {
+    let addresses = raw
+        .addresses
+        .iter()
+        .map(|a| a.trim().parse::<IpAddr>().map_err(|_| format!("invalid dns_proxy address {a:?}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if addresses.is_empty() {
+        return Err("dns_proxy.addresses must not be empty".to_string());
+    }
+    let servers = raw.servers.iter().map(|s| parse_resolver(s)).collect::<Result<Vec<_>, _>>()?;
+    if servers.is_empty() {
+        return Err("dns_proxy.servers must not be empty".to_string());
+    }
+    let fallback_servers = raw
+        .fallback_servers
+        .iter()
+        .map(|s| parse_resolver(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut fallback_sockets = Vec::new();
+    for fd in raw.fallback_fds {
+        // SAFETY: the app passes fds of sockets it owns and keeps open across
+        // this call; we only take our own dup.
+        let owned = unsafe { BorrowedFd::borrow_raw(fd) }
+            .try_clone_to_owned()
+            .map_err(|e| format!("cannot dup dns_proxy fallback fd {fd}: {e}"))?;
+        let socket = std::net::UdpSocket::from(owned);
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| format!("cannot make dns_proxy fallback fd {fd} non-blocking: {e}"))?;
+        fallback_sockets.push(socket);
+    }
+    Ok(DnsProxyConfig {
+        addresses,
+        match_domains: raw.match_domains,
+        servers,
+        fallback_servers,
+        fallback_sockets,
+    }
+    .normalized())
 }
 
 /// Parse CIDR strings into typed prefixes, failing on the first malformed entry
@@ -121,19 +218,38 @@ where
         .collect()
 }
 
+/// Default log filter for the mobile clients (overridable via `RUST_LOG` where
+/// the platform lets the app set environment variables).
+const DEFAULT_LOG_FILTER: &str = "info,iroh=warn,tracing=warn";
+
 /// Initialize logging. Safe to call multiple times; subsequent calls are no-ops.
 ///
-/// Reads `RUST_LOG` (defaults to `info,iroh=warn,tracing=warn`). On iOS the output goes to stderr,
-/// which the system captures into the unified log / Console.
+/// Reads `RUST_LOG` (defaults to `info,iroh=warn,tracing=warn`). On Apple
+/// platforms the output goes to stderr, which the system captures into the
+/// unified log / Console. On Android stderr is discarded, so the output goes to
+/// logcat under the tag `ezvpn` instead.
 ///
 /// # Safety
 /// No arguments; always safe to call.
 #[unsafe(no_mangle)]
 pub extern "C" fn ezvpn_init_logging() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,iroh=warn,tracing=warn"),
-    )
-    .try_init();
+    #[cfg(target_os = "android")]
+    {
+        let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| DEFAULT_LOG_FILTER.to_string());
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_max_level(log::LevelFilter::Trace)
+                .with_tag("ezvpn")
+                .with_filter(android_logger::FilterBuilder::new().parse(&filter).build()),
+        );
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or(DEFAULT_LOG_FILTER),
+        )
+        .try_init();
+    }
 }
 
 /// Generate a fresh client authentication keypair. Writes
@@ -260,7 +376,10 @@ pub unsafe extern "C" fn ezvpn_connect(
     }
 }
 
-fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
+/// The shared connect path behind [`ezvpn_connect`] and the Android JNI
+/// `connect`: parse the config JSON, connect + handshake on a fresh runtime, and
+/// render the network-config JSON. Errors are ready-to-display messages.
+pub(crate) fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
     let cfg: FfiConfig =
         serde_json::from_str(json).map_err(|e| format!("invalid config JSON: {e}"))?;
 
@@ -268,12 +387,13 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
         .map_err(|e| format!("{e:#}"))?;
     let client_key = crate::auth::ClientKey::from_secret_str(cfg.auth_key.trim())
         .map_err(|e| format!("invalid auth key: {e:#}"))?;
-    let ios_config = IosConfig {
+    let ios_config = MobileConfig {
         server_node_id: cfg.server_node_id,
         client_key,
         relay_config: relay_config.clone(),
         routes: parse_routes::<Ipv4Net>(&cfg.routes, "IPv4 route")?,
         routes6: parse_routes::<Ipv6Net>(&cfg.routes6, "IPv6 route")?,
+        dns_proxy: cfg.dns_proxy.map(parse_dns_proxy).transpose()?,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -282,7 +402,7 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
         .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
 
     let session = runtime
-        .block_on(IosSession::connect(&ios_config))
+        .block_on(MobileSession::connect(ios_config))
         .map_err(|e| format!("connect failed: {e}"))?;
 
     let net = session
@@ -355,26 +475,81 @@ pub unsafe extern "C" fn ezvpn_conn_path(
         return -1;
     }
     let handle = unsafe { &*handle };
-    // The relay health check performs on-demand HTTP, so drive the async
-    // snapshot on the embedded runtime. Called from the extension's own thread
-    // (never a runtime worker), so `block_on` is safe and does not stall the
-    // running tunnel task.
-    let snapshot = handle
-        .runtime
-        .block_on(connection_snapshot(&handle.connection, &handle.relay_config));
-    let paths: Vec<_> = snapshot.paths
-        .into_iter()
-        .map(|p| {
-            let kind = match p.kind {
-                ConnPathKind::Direct => "direct",
-                ConnPathKind::Relay => "relay",
-                ConnPathKind::Other => "other",
-            };
-            serde_json::json!({ "kind": kind, "display": p.display, "selected": p.selected })
-        })
-        .collect();
-    let json = serde_json::json!({ "paths": paths, "custom_relays": snapshot.custom_relays }).to_string();
+    let json = handle.conn_path_json();
     if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+}
+
+impl EzvpnHandle {
+    /// The [`ezvpn_conn_path`] JSON document for this session.
+    pub(crate) fn conn_path_json(&self) -> String {
+        // The relay health check performs on-demand HTTP, so drive the async
+        // snapshot on the embedded runtime. Called from the app's own thread
+        // (never a runtime worker), so `block_on` is safe and does not stall
+        // the running tunnel task.
+        let snapshot = self
+            .runtime
+            .block_on(connection_snapshot(&self.connection, &self.relay_config));
+        let paths: Vec<_> = snapshot
+            .paths
+            .into_iter()
+            .map(|p| {
+                let kind = match p.kind {
+                    ConnPathKind::Direct => "direct",
+                    ConnPathKind::Relay => "relay",
+                    ConnPathKind::Other => "other",
+                };
+                serde_json::json!({ "kind": kind, "display": p.display, "selected": p.selected })
+            })
+            .collect();
+        serde_json::json!({ "paths": paths, "custom_relays": snapshot.custom_relays }).to_string()
+    }
+
+    /// The shared body of [`ezvpn_run`]: `dup` the tun fd synchronously, then
+    /// spawn the data loop on the embedded runtime. `on_exit`, when given, runs
+    /// on the runtime once the loop ends on its own (see [`ExitHook`]).
+    pub(crate) fn run(&mut self, tun_fd: c_int, on_exit: Option<ExitHook>) -> Result<(), String> {
+        let Some(session) = self.session.take() else {
+            return Err("no pending session (already running or never connected)".to_string());
+        };
+
+        // Take our own owned dup now, on the caller's thread, so the library
+        // holds a valid fd regardless of when the caller closes its copy. The
+        // dup is moved into the task and closed when the tunnel ends.
+        let owned_fd = match unsafe { BorrowedFd::borrow_raw(tun_fd) }.try_clone_to_owned() {
+            Ok(fd) => fd,
+            Err(e) => {
+                // Put the session back so the handle can still be stopped/freed.
+                self.session = Some(session);
+                return Err(format!("failed to dup tun fd: {e}"));
+            }
+        };
+
+        let task = self.runtime.spawn(async move {
+            // `owned_fd` is owned by this task and closed when it ends; `run`
+            // dups it again into the TunDevice, so our copy outlives that
+            // internal dup setup.
+            let result = session.run(owned_fd.as_raw_fd()).await;
+            drop(owned_fd);
+            if let Some(hook) = on_exit {
+                hook(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+            }
+            result
+        });
+        self.task = Some(task);
+        Ok(())
+    }
+
+    /// The shared body of [`ezvpn_stop`]: abort the loop (if any) and shut the
+    /// runtime down without blocking the caller. Consumes (frees) the handle.
+    pub(crate) fn stop(self: Box<Self>) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+        // Drop any still-pending (never-run) session and shut the runtime down
+        // without blocking the caller; tasks are aborted above.
+        self.runtime.shutdown_background();
+        // `self` (Box) drops here, freeing the allocation.
+    }
 }
 
 /// Start the tunnel data loop on `tun_fd` (the extension's `utun` fd).
@@ -396,32 +571,13 @@ pub unsafe extern "C" fn ezvpn_run(handle: *mut EzvpnHandle, tun_fd: c_int) -> c
         return -1;
     }
     let handle = unsafe { &mut *handle };
-    let Some(session) = handle.session.take() else {
-        return -1;
-    };
-
-    // Take our own owned dup now, on the caller's thread, so the library holds a
-    // valid fd regardless of when the caller closes its copy. The dup is moved
-    // into the task and closed when the tunnel ends.
-    let owned_fd = match unsafe { BorrowedFd::borrow_raw(tun_fd) }.try_clone_to_owned() {
-        Ok(fd) => fd,
+    match handle.run(tun_fd, None) {
+        Ok(()) => 0,
         Err(e) => {
-            log::error!("ezvpn_run: failed to dup utun fd: {e}");
-            // Put the session back so the handle can still be stopped/freed.
-            handle.session = Some(session);
-            return -1;
+            log::error!("ezvpn_run: {e}");
+            -1
         }
-    };
-
-    let task = handle.runtime.spawn(async move {
-        // `owned_fd` is owned by this task and closed when it ends; `run` dups it
-        // again into the TunDevice, so our copy outlives that internal dup setup.
-        let result = session.run(owned_fd.as_raw_fd()).await;
-        drop(owned_fd);
-        result
-    });
-    handle.task = Some(task);
-    0
+    }
 }
 
 /// Stop the tunnel and free the handle.
@@ -437,14 +593,7 @@ pub unsafe extern "C" fn ezvpn_stop(handle: *mut EzvpnHandle) {
     if handle.is_null() {
         return;
     }
-    let handle = unsafe { Box::from_raw(handle) };
-    if let Some(task) = &handle.task {
-        task.abort();
-    }
-    // Drop any still-pending (never-run) session and shut the runtime down
-    // without blocking the caller; tasks are aborted above.
-    handle.runtime.shutdown_background();
-    // `handle` (Box) drops here, freeing the allocation.
+    unsafe { Box::from_raw(handle) }.stop();
 }
 
 /// Write `s` (always NUL-terminated) into the caller buffer. Returns `true` if
@@ -457,7 +606,7 @@ fn write_cstr(buf: *mut c_char, len: usize, s: &str) -> bool {
     // Reserve one byte for the trailing NUL.
     let copy = bytes.len().min(len - 1);
     unsafe {
-        ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, copy);
+        ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast::<u8>(), copy);
         *buf.add(copy) = 0;
     }
     copy == bytes.len()

@@ -5,18 +5,18 @@
 //! IP-over-QUIC tunnel. IP packets are framed and sent directly over the
 //! encrypted iroh QUIC connection for automatic NAT traversal.
 
-// On iOS only the portable data plane (run_tunnel + the handshake) is used;
-// VpnClient, routing, the bypass manager and the reconnect wrapper are all
-// desktop-only (they need the gated-out control/runtime modules) and compile
+// On iOS and Android only the portable data plane (run_tunnel + the handshake)
+// is used; VpnClient, routing, the bypass manager and the reconnect wrapper are
+// all desktop-only (they need the gated-out control/runtime modules) and compile
 // here as dead code. Silence the resulting unused-import / dead-code noise on
-// iOS rather than finely gating every line.
-#![cfg_attr(target_os = "ios", allow(unused_imports, dead_code))]
+// the mobile targets rather than finely gating every line.
+#![cfg_attr(any(target_os = "ios", target_os = "android"), allow(unused_imports, dead_code))]
 
 use crate::net::buffer::uninitialized_vec;
-// Not iOS-gated: `perform_handshake` is the shared connect path, used by the
-// iOS session too.
+// Not mobile-gated: `perform_handshake` is the shared connect path, used by the
+// mobile session too.
 use crate::auth::ClientKey;
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use crate::config::VpnClientConfig;
 use crate::tunnel::stream::{
     FRAME_ARENA_CHUNK, Frame, MAX_FRAME_BODY, classify, read_frame, send_ip_datagrams,
@@ -25,14 +25,15 @@ use crate::net::device::{
     BypassRouteGuard, Route6Guard, RouteGuard, TunConfig, TunDevice, UnderlayGateway,
     add_bypass_route, add_routes, add_routes6_with_src, query_default_gateway,
 };
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use crate::control::{ClientConnectedInfo, ClientStatusHandle};
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use crate::net::local_networks::{has_refusable_routes, local_networks, overlap_error};
 use crate::error::{VpnError, VpnResult};
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use crate::runtime::{LockRole, VpnLock};
 use crate::tunnel::offload::VirtioNetHdr;
+use crate::tunnel::dns_proxy::{self, DnsProxyConfig};
 use crate::transport::paths::watch_connection_paths;
 use crate::config::VPN_MTU;
 use crate::tunnel::signaling::{
@@ -75,9 +76,9 @@ const SERVER_ADDR_CHANNEL_SIZE: usize = 8;
 const RESOLVE_RELAY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A decoded inbound packet queued for the dedicated TUN writer task.
-struct InboundTunWrite {
-    packet: Bytes,
-    offload: Option<VirtioNetHdr>,
+pub(crate) struct InboundTunWrite {
+    pub(crate) packet: Bytes,
+    pub(crate) offload: Option<VirtioNetHdr>,
 }
 
 /// Enqueue a decoded inbound packet on the TUN writer channel.
@@ -86,7 +87,7 @@ struct InboundTunWrite {
 /// the lock-free `try_send` fast path and only `.await`s when the channel is
 /// full (backpressure), avoiding a guaranteed task wake-up per received packet.
 /// Returns `false` if the channel is closed.
-async fn enqueue_inbound_tun_write(tx: &mpsc::Sender<InboundTunWrite>, req: InboundTunWrite) -> bool {
+pub(crate) async fn enqueue_inbound_tun_write(tx: &mpsc::Sender<InboundTunWrite>, req: InboundTunWrite) -> bool {
     match tx.try_send(req) {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(req)) => tx.send(req).await.is_ok(),
@@ -97,9 +98,9 @@ async fn enqueue_inbound_tun_write(tx: &mpsc::Sender<InboundTunWrite>, req: Inbo
 /// VPN client instance.
 ///
 /// Desktop-only: holds the single-instance lock and the control-socket status
-/// handle. On iOS the connect path lives in [`crate::tunnel::ios`] and drives an
+/// handle. On iOS the connect path lives in [`crate::tunnel::mobile`] and drives an
 /// OS-provided utun fd instead.
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub struct VpnClient {
     /// Client configuration.
     config: VpnClientConfig,
@@ -253,7 +254,7 @@ fn check_params_against(
     )))
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 impl VpnClient {
     /// Create a new VPN client.
     ///
@@ -581,6 +582,7 @@ impl VpnClient {
             bypass_route_guard,
             server_addr_tx,
             local_iroh_udp_ports,
+            None,
         )
         .await;
 
@@ -785,7 +787,7 @@ impl VpnClient {
 /// stays open as the reliable data stream.
 ///
 /// Shared by the desktop [`VpnClient`] and the iOS connect path
-/// ([`crate::tunnel::ios`]): both open a bi-stream, send a [`VpnHandshake`]
+/// ([`crate::tunnel::mobile`]): both open a bi-stream, send a [`VpnHandshake`]
 /// (advertising data-channel GSO), and parse the [`VpnHandshakeResponse`]. The
 /// `device_id` keys the server's idempotent IP allocation; `client_key` signs
 /// `own_id` (this client's own ephemeral endpoint id) so the credential is
@@ -888,6 +890,12 @@ pub(crate) async fn perform_handshake(
 /// function shovels packets between the TUN device and datagrams, and drains
 /// control frames off the stream. Peer liveness is detected by
 /// `Connection::closed()` (QUIC keep-alive + idle timeout) — no app heartbeat.
+///
+/// `dns_proxy` enables the Android in-tunnel split-DNS forwarder
+/// ([`crate::tunnel::dns_proxy`]): packets to its proxy address are diverted
+/// from the outbound path to the forwarder task, whose replies enter the TUN
+/// writer channel like inbound packets. Every other caller passes `None`.
+#[allow(clippy::too_many_arguments)] // one optional hook per platform concern; a struct would only rename them
 pub(crate) async fn run_tunnel(
     tun_device: TunDevice,
     connection: Connection,
@@ -896,6 +904,7 @@ pub(crate) async fn run_tunnel(
     bypass_route_guard: Option<AbortOnDropTask>,
     server_addr_tx: Option<mpsc::Sender<HashSet<IpAddr>>>,
     local_iroh_udp_ports: Arc<HashSet<u16>>,
+    dns_proxy: Option<DnsProxyConfig>,
 ) -> VpnResult<()> {
     // Split TUN device. This is the last point setup can return early, so the
     // bypass guard stays armed across it; once the split succeeds we disarm it
@@ -911,6 +920,22 @@ pub(crate) async fn run_tunnel(
     // the only stream traffic is the server -> client ServerAddrs control
     // frames. Hold the send half so the bi-stream stays established.
     let _data_send = data_send;
+
+    // Create channel for inbound packets to decouple frame receipt from TUN
+    // write syscalls. The TUN writer task owns the TunWriter.
+    let (tun_write_tx, mut tun_write_rx) =
+        mpsc::channel::<InboundTunWrite>(INBOUND_TUN_CHANNEL_SIZE);
+
+    // Android split-DNS forwarder (see `dns_proxy`): the outbound task hands it
+    // packets for the proxy address; it answers through the TUN writer channel.
+    let (dns_intercept, dns_proxy_handle) = match dns_proxy {
+        Some(cfg) => {
+            let (intercept, rx) = dns_proxy::intercept_channel(&cfg);
+            let handle = tokio::spawn(dns_proxy::run_dns_proxy(cfg, rx, tun_write_tx.clone()));
+            (Some(intercept), Some(handle))
+        }
+        None => (None, None),
+    };
 
     // Spawn outbound task (TUN -> unreliable QUIC datagrams). Each TUN packet
     // maps to one datagram; an offload super-frame is software-segmented into
@@ -951,6 +976,13 @@ pub(crate) async fn run_tunnel(
                         continue;
                     }
 
+                    if let Some(intercept) = &dns_intercept
+                        && intercept.wants(packet)
+                    {
+                        intercept.capture(packet);
+                        continue;
+                    }
+
                     let outcome = send_ip_datagrams(
                         &conn_out,
                         &mut arena,
@@ -986,11 +1018,6 @@ pub(crate) async fn run_tunnel(
             }
         }
     });
-
-    // Create channel for inbound packets to decouple frame receipt from TUN
-    // write syscalls. The TUN writer task owns the TunWriter.
-    let (tun_write_tx, mut tun_write_rx) =
-        mpsc::channel::<InboundTunWrite>(INBOUND_TUN_CHANNEL_SIZE);
 
     // Spawn dedicated TUN writer task. Batched channel receives reduce
     // task wakeups; write_batch coalesces consecutive same-flow TCP
@@ -1177,6 +1204,9 @@ pub(crate) async fn run_tunnel(
     if let Some(ref task) = bypass_route_task {
         task.abort();
     }
+    if let Some(task) = &dns_proxy_handle {
+        task.abort();
+    }
 
     // Await all remaining handles to ensure cleanup (aborted tasks return Cancelled)
     let mut all_results = vec![(first_task, first_result)];
@@ -1224,7 +1254,7 @@ pub(crate) async fn run_tunnel(
     Err(VpnError::ConnectionLost(reason))
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 impl VpnClient {
     /// Connect to the VPN server with automatic reconnection on failure.
     ///
@@ -1553,7 +1583,7 @@ impl Drop for AbortOnDropTask {
 /// Polling is deliberate: the event-driven watcher crates are event-driven
 /// only on the deprioritized platforms and would poll on macOS anyway (see
 /// docs/Desktop-Overlap-and-Network-Change-Plan.md §2).
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 const LOCAL_NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Spawn the mid-session overlap watcher (§2): poll the on-link networks and,
@@ -1567,7 +1597,7 @@ const LOCAL_NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(5);
 ///
 /// The returned guard aborts the watcher on drop; `connect()` holds it across
 /// `run_tunnel` so the watcher never outlives the session.
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn spawn_local_network_overlap_watch(
     routes4: Vec<Ipv4Net>,
     routes6: Vec<Ipv6Net>,
@@ -1799,7 +1829,7 @@ fn private_scope(ip: &IpAddr) -> bool {
 /// Only the iOS connect path consumes this (desktop applies the same
 /// `private_scope` filter inside `BypassRouteManager::update`), so it is dead
 /// code on non-iOS builds outside the unit tests.
-#[cfg_attr(not(any(target_os = "ios", test)), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "ios", target_os = "android", test)), allow(dead_code))]
 pub(crate) fn overlapping_underlay_excludes(
     server_addrs: &[IpAddr],
     routes4: &[Ipv4Net],

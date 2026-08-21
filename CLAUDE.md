@@ -21,3 +21,15 @@ address lookup, the per-relay startup probe, relay auth tokens, relay
 self-hosting — is documented once in
 https://github.com/flexaccessdev/iroh-common-architecture. Do not duplicate it in
 this repo; update it there and link to it.
+
+The mobile apps live in sibling repos: `../ezvpn-apple` (Swift, see
+`docs/Apple-App.md`) and `../ezvpn-android` (Kotlin, see `docs/Android-App.md`).
+Both drive the fd-based `MobileSession` in `src/tunnel/mobile.rs` through
+`src/ffi.rs`; Android adds the JNI layer `src/ffi_android.rs`, whose symbol
+names are bound to the Kotlin class `dev.flexaccess.ezvpn.EzvpnNative` — do not
+rename either side alone. The in-tunnel split-DNS forwarder
+(`src/tunnel/dns_proxy.rs`) is an Android-only workaround for the platform
+having no per-domain VPN DNS; every other platform keeps OS-level conditional
+forwarding, so never wire it up elsewhere. Verify Android changes with
+`cargo ndk -t arm64-v8a --platform 29 clippy --lib -- -D warnings` (the module
+is cfg-gated out of the host clippy).

@@ -49,7 +49,7 @@ There is **no Windows equivalent of `NEPacketTunnelProvider`** that hands an app
 a ready TUN fd. So the Windows FFI wraps the desktop
 [`VpnClient`](../src/tunnel/client.rs) — which already creates the wintun
 adapter, installs routes, auto-reconnects, and publishes a status snapshot on
-Windows — instead of the slim fd-driven `IosSession`. That also means the FFI is
+Windows — instead of the slim fd-driven `MobileSession`. That also means the FFI is
 a *start / status / stop* shape rather than *connect / run(fd) / stop*, and the
 GUI reads status **in-process** rather than over the named-pipe control endpoint.
 

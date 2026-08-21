@@ -21,7 +21,7 @@ jobs:
         run: cargo test
 
   # The host clippy compiles the Apple-gated modules (src/ffi.rs,
-  # src/tunnel/ios.rs), which Linux CI never type-checks.
+  # src/tunnel/mobile.rs), which Linux CI never type-checks.
   macos:
     runs-on: macos-latest
     steps:
@@ -42,6 +42,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build Apple xcframework + header (debug)
         run: ./build-apple.sh debug
+
+  # Clippy for the Android-gated modules (src/ffi_android.rs and the Android
+  # branches of src/ffi.rs / src/tunnel/mobile.rs), plus a verify-only build of
+  # libezvpn.so for the two arm ABIs (debug profile for speed), mirroring the
+  # release workflow's build-android-lib job. Nothing is published.
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Clippy (arm64-v8a)
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: |
+          rustup target add aarch64-linux-android
+          cargo ndk -t arm64-v8a --platform 29 clippy --lib -- -D warnings
+      - name: Build libezvpn.so (debug)
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: ABIS="arm64-v8a armeabi-v7a" ./build-android.sh debug
 
   # The host clippy compiles the Windows-gated module (src/ffi_windows.rs).
   windows:
