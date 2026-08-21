@@ -72,9 +72,10 @@ pub struct DnsProxyConfig {
     /// then goes to `servers`, which degrades to all-DNS-through-tunnel rather
     /// than breaking resolution.
     pub fallback_servers: Vec<SocketAddr>,
-    /// Non-blocking UDP sockets the app has `protect()`ed, one per family at
-    /// most, used for the fallback upstreams. A family without one gets a plain
-    /// socket (fine unless a tunnel route captures the fallback resolver).
+    /// UDP sockets the app has `protect()`ed, one per family at most, used for
+    /// the fallback upstreams (switched to non-blocking here). A family without
+    /// one gets a plain socket (fine unless a tunnel route captures the
+    /// fallback resolver).
     pub fallback_sockets: Vec<std::net::UdpSocket>,
 }
 
@@ -354,10 +355,21 @@ struct Pending {
 }
 
 /// Lazily created upstream sockets, one per (kind, family); the fallback ones
-/// come pre-protected from the app.
+/// come pre-protected from the app. Each socket has a reader task feeding
+/// `reply_tx`; the tasks are aborted with the proxy so the sockets close then,
+/// not after the next stray datagram.
 struct Upstreams {
     sockets: HashMap<(UpstreamKind, Family), Arc<UdpSocket>>,
+    readers: Vec<tokio::task::JoinHandle<()>>,
     reply_tx: mpsc::Sender<(Bytes, SocketAddr)>,
+}
+
+impl Drop for Upstreams {
+    fn drop(&mut self) {
+        for reader in &self.readers {
+            reader.abort();
+        }
+    }
 }
 
 impl Upstreams {
@@ -389,7 +401,7 @@ impl Upstreams {
     fn install(&mut self, kind: UpstreamKind, family: Family, socket: Arc<UdpSocket>) {
         let reader = socket.clone();
         let reply_tx = self.reply_tx.clone();
-        tokio::spawn(async move {
+        self.readers.push(tokio::spawn(async move {
             let mut buf = vec![0u8; UPSTREAM_BUF];
             loop {
                 match reader.recv_from(&mut buf).await {
@@ -406,7 +418,7 @@ impl Upstreams {
                     }
                 }
             }
-        });
+        }));
         self.sockets.insert((kind, family), socket);
     }
 }
@@ -421,6 +433,7 @@ pub(crate) async fn run_dns_proxy(
     let (reply_tx, mut replies) = mpsc::channel::<(Bytes, SocketAddr)>(CAPTURE_QUEUE);
     let mut upstreams = Upstreams {
         sockets: HashMap::new(),
+        readers: Vec::new(),
         reply_tx,
     };
     for std_socket in cfg.fallback_sockets {
@@ -431,6 +444,11 @@ pub(crate) async fn run_dns_proxy(
                 continue;
             }
         };
+        // tokio requires the socket to be non-blocking before adopting it.
+        if let Err(e) = std_socket.set_nonblocking(true) {
+            log::warn!("DNS proxy: cannot make the protected {family:?} socket non-blocking: {e}");
+            continue;
+        }
         match UdpSocket::from_std(std_socket) {
             Ok(s) => upstreams.install(UpstreamKind::Fallback, family, Arc::new(s)),
             Err(e) => log::warn!("DNS proxy: cannot adopt the protected {family:?} socket: {e}"),
@@ -483,7 +501,7 @@ pub(crate) async fn run_dns_proxy(
                             UpstreamKind::Fallback => &fallback_servers,
                         };
                         if servers.is_empty() {
-                            log::debug!("DNS proxy: no {kind:?} resolver for {name}");
+                            log::trace!("DNS proxy: no {kind:?} resolver for {name}");
                             continue;
                         }
                         rotation = rotation.wrapping_add(1);
@@ -492,7 +510,7 @@ pub(crate) async fn run_dns_proxy(
                             continue;
                         };
                         if pending.len() >= MAX_PENDING {
-                            expire(&mut pending, Duration::ZERO);
+                            evict_oldest(&mut pending);
                         }
                         let original_id = u16::from_be_bytes([dns[0], dns[1]]);
                         let id = loop {
@@ -553,6 +571,14 @@ fn expire(pending: &mut HashMap<u16, Pending>, max_age: Duration) {
     let dropped = before - pending.len();
     if dropped > 0 {
         log::trace!("DNS proxy: expired {dropped} unanswered query(ies)");
+    }
+}
+
+/// Make room for one more in-flight query by dropping the oldest one.
+fn evict_oldest(pending: &mut HashMap<u16, Pending>) {
+    if let Some(id) = pending.iter().min_by_key(|(_, p)| p.sent_at).map(|(id, _)| *id) {
+        pending.remove(&id);
+        log::trace!("DNS proxy: pending table full; evicted the oldest query (id {id:#06x})");
     }
 }
 

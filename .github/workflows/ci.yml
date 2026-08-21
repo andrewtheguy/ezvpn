@@ -45,7 +45,7 @@ jobs:
 
   # Clippy for the Android-gated modules (src/ffi_android.rs and the Android
   # branches of src/ffi.rs / src/tunnel/mobile.rs), plus a verify-only build of
-  # libezvpn.so for the two arm ABIs (debug profile for speed), mirroring the
+  # libezvpn.so for every release ABI (debug profile for speed), mirroring the
   # release workflow's build-android-lib job. Nothing is published.
   android:
     runs-on: ubuntu-latest
@@ -63,7 +63,7 @@ jobs:
       - name: Build libezvpn.so (debug)
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
-        run: ABIS="arm64-v8a armeabi-v7a" ./build-android.sh debug
+        run: ABIS="arm64-v8a armeabi-v7a x86_64" ./build-android.sh debug
 
   # The host clippy compiles the Windows-gated module (src/ffi_windows.rs).
   windows:

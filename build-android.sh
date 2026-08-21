@@ -66,23 +66,31 @@ if [ -z "$SYSROOT" ]; then
   fi
   echo "NDK: ${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-<cargo-ndk default>}}"
 else
-  [ -d "$SYSROOT/usr/lib/aarch64-linux-android" ] || {
-    echo "EZVPN_NDK_SYSROOT=$SYSROOT does not look like an NDK sysroot" >&2; exit 1; }
   for tool in clang ld.lld llvm-ar; do
     command -v "$tool" >/dev/null 2>&1 || { echo "$tool not found (needed with EZVPN_NDK_SYSROOT)" >&2; exit 1; }
   done
   # Rust's Android std links -lunwind, which the NDK keeps in its clang
-  # resource dir rather than the sysroot; a plain sysroot copy lacks it.
-  if [ ! -e "$SYSROOT/usr/lib/aarch64-linux-android/libunwind.a" ]; then
-    cat >&2 <<HINT
-EZVPN_NDK_SYSROOT=$SYSROOT has no libunwind.a. Copy it from the NDK the sysroot
-came from, for every target you build:
-  <ndk>/toolchains/llvm/prebuilt/*/lib/clang/<ver>/lib/linux/aarch64/libunwind.a -> $SYSROOT/usr/lib/aarch64-linux-android/
-  <ndk>/toolchains/llvm/prebuilt/*/lib/clang/<ver>/lib/linux/arm/libunwind.a     -> $SYSROOT/usr/lib/arm-linux-androideabi/
-  <ndk>/toolchains/llvm/prebuilt/*/lib/clang/<ver>/lib/linux/x86_64/libunwind.a  -> $SYSROOT/usr/lib/x86_64-linux-android/
+  # resource dir rather than the sysroot; a plain sysroot copy lacks it. Check
+  # the sysroot and libunwind.a for every ABI selected, not just one.
+  for abi in $ABIS; do
+    case "$abi" in
+      arm64-v8a)   libdir="aarch64-linux-android"; clangarch="aarch64" ;;
+      armeabi-v7a) libdir="arm-linux-androideabi"; clangarch="arm" ;;
+      x86_64)      libdir="x86_64-linux-android";  clangarch="x86_64" ;;
+      x86)         libdir="i686-linux-android";    clangarch="i386" ;;
+      *) echo "unknown ABI '$abi'" >&2; exit 1 ;;
+    esac
+    [ -d "$SYSROOT/usr/lib/$libdir" ] || {
+      echo "EZVPN_NDK_SYSROOT=$SYSROOT does not look like an NDK sysroot (no usr/lib/$libdir for $abi)" >&2; exit 1; }
+    if [ ! -e "$SYSROOT/usr/lib/$libdir/libunwind.a" ]; then
+      cat >&2 <<HINT
+EZVPN_NDK_SYSROOT=$SYSROOT has no libunwind.a for $abi. Copy it from the NDK the
+sysroot came from, for every target you build:
+  <ndk>/toolchains/llvm/prebuilt/*/lib/clang/<ver>/lib/linux/$clangarch/libunwind.a -> $SYSROOT/usr/lib/$libdir/
 HINT
-    exit 1
-  fi
+      exit 1
+    fi
+  done
   echo "NDK sysroot: $SYSROOT (system $(clang --version | head -1))"
 fi
 

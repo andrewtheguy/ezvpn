@@ -63,22 +63,14 @@ pub extern "system" fn Java_dev_flexaccess_ezvpn_EzvpnNative_init<'local>(
     if ANDROID_CONTEXT.get().is_some() {
         return;
     }
-    let (vm, context_ref) = match (env.get_java_vm(), env.new_global_ref(&context)) {
-        (Ok(vm), Ok(context_ref)) => (vm, context_ref),
-        (Err(e), _) | (_, Err(e)) => {
-            log::error!("ezvpn init: cannot capture the JVM/context: {e}");
-            return;
-        }
-    };
-    match (env.get_java_vm(), env.new_global_ref(&class)) {
-        (Ok(vm), Ok(class_ref)) => {
-            let _ = JVM.set((vm, class_ref));
-        }
-        (Err(e), _) | (_, Err(e)) => {
-            log::error!("ezvpn init: cannot capture the JVM/class for the exit callback: {e}");
-            return;
-        }
-    }
+    let (vm, context_ref, class_ref) =
+        match (env.get_java_vm(), env.new_global_ref(&context), env.new_global_ref(&class)) {
+            (Ok(vm), Ok(context_ref), Ok(class_ref)) => (vm, context_ref, class_ref),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                log::error!("ezvpn init: cannot capture the JVM/context/class: {e}");
+                return;
+            }
+        };
     let vm_ptr = vm.get_java_vm_pointer().cast::<c_void>();
     let context_ptr = context_ref.as_obj().as_raw().cast::<c_void>();
     // The global ref must outlive every later JNI call through ndk-context,
@@ -88,6 +80,7 @@ pub extern "system" fn Java_dev_flexaccess_ezvpn_EzvpnNative_init<'local>(
     // pointer by construction, the context through the leaked global ref), and
     // the OnceLock guarantees a single registration.
     unsafe { ndk_context::initialize_android_context(vm_ptr, context_ptr) };
+    let _ = JVM.set((vm, class_ref));
     let _ = ANDROID_CONTEXT.set(());
 }
 

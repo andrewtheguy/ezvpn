@@ -67,6 +67,8 @@ use std::ffi::{CStr, c_char, c_int};
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ipnet::{Ipv4Net, Ipv6Net};
 use serde::Deserialize;
@@ -79,8 +81,9 @@ use crate::tunnel::mobile::{MobileConfig, MobileSession};
 
 /// Callback run on the embedded runtime when the data loop started by
 /// [`EzvpnHandle::run`] ends on its own (peer close, idle timeout, fatal I/O
-/// error). Not invoked when [`EzvpnHandle::stop`] aborts the loop — the caller
-/// initiated that and needs no notification.
+/// error). Never invoked once [`EzvpnHandle::stop`] has been called — the
+/// caller initiated that and needs no notification — even if the loop happens
+/// to end on its own at the same moment.
 pub(crate) type ExitHook = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
 
 /// Opaque handle owned by the app side. Created by [`ezvpn_connect`], freed by
@@ -91,6 +94,10 @@ pub struct EzvpnHandle {
     session: Option<MobileSession>,
     /// The running tunnel task, present after [`ezvpn_run`].
     task: Option<tokio::task::JoinHandle<VpnResult<()>>>,
+    /// Set by [`EzvpnHandle::stop`] before the task is aborted; the task checks
+    /// it before running the [`ExitHook`], so a loop that ends concurrently
+    /// with `stop` stays silent as documented.
+    stopped: Arc<AtomicBool>,
     /// Clone of the live iroh connection, kept so [`ezvpn_conn_path`] can
     /// snapshot its paths on demand after `ezvpn_run` consumed the session.
     connection: iroh::endpoint::Connection,
@@ -150,7 +157,8 @@ fn parse_resolver(raw: &str) -> Result<SocketAddr, String> {
     let (host, scope) = match raw.split_once('%') {
         Some((h, s)) => (
             h,
-            s.parse::<u32>()
+            s.trim()
+                .parse::<u32>()
                 .map_err(|_| format!("invalid resolver scope in {raw:?} (expected a numeric interface index)"))?,
         ),
         None => (raw, 0),
@@ -160,6 +168,9 @@ fn parse_resolver(raw: &str) -> Result<SocketAddr, String> {
         .parse()
         .map_err(|_| format!("invalid resolver address {raw:?}"))?;
     Ok(match ip {
+        IpAddr::V4(_) if scope != 0 => {
+            return Err(format!("invalid resolver address {raw:?} (IPv4 addresses take no scope)"));
+        }
         IpAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, crate::tunnel::dns_proxy::DNS_PORT)),
         IpAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(v6, crate::tunnel::dns_proxy::DNS_PORT, 0, scope)),
     })
@@ -190,11 +201,7 @@ fn parse_dns_proxy(raw: FfiDnsProxy) -> Result<DnsProxyConfig, String> {
         let owned = unsafe { BorrowedFd::borrow_raw(fd) }
             .try_clone_to_owned()
             .map_err(|e| format!("cannot dup dns_proxy fallback fd {fd}: {e}"))?;
-        let socket = std::net::UdpSocket::from(owned);
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| format!("cannot make dns_proxy fallback fd {fd} non-blocking: {e}"))?;
-        fallback_sockets.push(socket);
+        fallback_sockets.push(std::net::UdpSocket::from(owned));
     }
     Ok(DnsProxyConfig {
         addresses,
@@ -430,6 +437,7 @@ pub(crate) fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String>
             runtime,
             session: Some(session),
             task: None,
+            stopped: Arc::new(AtomicBool::new(false)),
             connection,
             relay_config,
         },
@@ -524,13 +532,18 @@ impl EzvpnHandle {
             }
         };
 
+        let stopped = self.stopped.clone();
         let task = self.runtime.spawn(async move {
             // `owned_fd` is owned by this task and closed when it ends; `run`
             // dups it again into the TunDevice, so our copy outlives that
             // internal dup setup.
             let result = session.run(owned_fd.as_raw_fd()).await;
             drop(owned_fd);
-            if let Some(hook) = on_exit {
+            // `stop` sets the flag before aborting, so a loop that ends on its
+            // own in the same instant still honors "stop never notifies".
+            if let Some(hook) = on_exit
+                && !stopped.load(Ordering::Acquire)
+            {
                 hook(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
             }
             result
@@ -542,6 +555,9 @@ impl EzvpnHandle {
     /// The shared body of [`ezvpn_stop`]: abort the loop (if any) and shut the
     /// runtime down without blocking the caller. Consumes (frees) the handle.
     pub(crate) fn stop(self: Box<Self>) {
+        // Silence the exit hook first: the abort below only lands at the
+        // task's next await point, and the loop may already be past its last.
+        self.stopped.store(true, Ordering::Release);
         if let Some(task) = &self.task {
             task.abort();
         }
