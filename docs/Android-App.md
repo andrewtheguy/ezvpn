@@ -32,7 +32,9 @@ In scope:
   a routed prefix are carved back out of the tunnel (see below).
 - **Always-on VPN** — the service accepts the system's always-on start and
   connects the last-used profile.
-- **Real-device testing** — developed against a physical device over adb.
+- **On-device testing** — developed and tested on an adb-connected arm64
+  Android emulator (a `VpnService` cannot run on the JVM); the physical device
+  only receives the signed release APK.
 
 Out of scope (by design):
 
