@@ -86,6 +86,12 @@ use crate::tunnel::mobile::{MobileConfig, MobileSession};
 /// to end on its own at the same moment.
 pub(crate) type ExitHook = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
 
+/// Upper bound on the graceful endpoint close in [`EzvpnHandle::stop`]. The
+/// CONNECTION_CLOSE goes out immediately; this only caps how long the
+/// teardown thread waits for the peer's acknowledgement before dropping the
+/// runtime.
+const STOP_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Opaque handle owned by the app side. Created by [`ezvpn_connect`], freed by
 /// [`ezvpn_stop`].
 pub struct EzvpnHandle {
@@ -101,6 +107,9 @@ pub struct EzvpnHandle {
     /// Clone of the live iroh connection, kept so [`ezvpn_conn_path`] can
     /// snapshot its paths on demand after `ezvpn_run` consumed the session.
     connection: iroh::endpoint::Connection,
+    /// Clone of the session's iroh endpoint, kept so [`EzvpnHandle::stop`] can
+    /// close it gracefully after `ezvpn_run` consumed the session.
+    endpoint: iroh::Endpoint,
     /// Configured custom relays, retained so [`ezvpn_conn_path`] can probe their
     /// `/healthz` on demand.
     relay_config: RelayConfig,
@@ -432,6 +441,7 @@ pub(crate) fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String>
     .to_string();
 
     let connection = session.connection();
+    let endpoint = session.endpoint();
     Ok((
         EzvpnHandle {
             runtime,
@@ -439,6 +449,7 @@ pub(crate) fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String>
             task: None,
             stopped: Arc::new(AtomicBool::new(false)),
             connection,
+            endpoint,
             relay_config,
         },
         result_json,
@@ -552,19 +563,62 @@ impl EzvpnHandle {
         Ok(())
     }
 
-    /// The shared body of [`ezvpn_stop`]: abort the loop (if any) and shut the
-    /// runtime down without blocking the caller. Consumes (frees) the handle.
+    /// The shared body of [`ezvpn_stop`]: abort the loop (if any), close the
+    /// iroh endpoint gracefully, and shut the runtime down — all without
+    /// blocking the caller. Consumes (frees) the handle.
+    ///
+    /// The graceful close matters: merely dropping the endpoint sends nothing,
+    /// so the server would only notice the client is gone at the QUIC idle
+    /// timeout (30 s) and keep the address lease until then. `Endpoint::close`
+    /// sends CONNECTION_CLOSE, so the server frees the lease immediately. It
+    /// needs the runtime alive to drive the socket, so the teardown runs on a
+    /// short-lived thread that owns the runtime, bounded by
+    /// [`STOP_CLOSE_TIMEOUT`].
     pub(crate) fn stop(self: Box<Self>) {
         // Silence the exit hook first: the abort below only lands at the
         // task's next await point, and the loop may already be past its last.
         self.stopped.store(true, Ordering::Release);
-        if let Some(task) = &self.task {
+        let EzvpnHandle {
+            runtime,
+            session,
+            task,
+            endpoint,
+            connection,
+            ..
+        } = *self;
+        if let Some(task) = &task {
             task.abort();
         }
-        // Drop any still-pending (never-run) session and shut the runtime down
-        // without blocking the caller; tasks are aborted above.
-        self.runtime.shutdown_background();
-        // `self` (Box) drops here, freeing the allocation.
+        // Release our own references to the connection so the close below
+        // has nothing else keeping it open; the aborted task drops its own
+        // copies at its next await point.
+        drop(connection);
+        drop(session);
+
+        let teardown = move || {
+            let started = std::time::Instant::now();
+            log::info!("ezvpn stop: closing endpoint");
+            // The timeout's timer must be created inside the runtime context
+            // (`tokio::time::timeout` registers it eagerly), so build it in the
+            // async block rather than on this plain thread.
+            let close = runtime.block_on(async {
+                tokio::time::timeout(STOP_CLOSE_TIMEOUT, endpoint.close()).await
+            });
+            match close {
+                Ok(()) => log::info!("ezvpn stop: endpoint closed in {:?}", started.elapsed()),
+                Err(_) => log::warn!("ezvpn stop: endpoint close timed out after {STOP_CLOSE_TIMEOUT:?}"),
+            }
+            drop(task);
+            runtime.shutdown_background();
+        };
+        if let Err(e) = std::thread::Builder::new()
+            .name("ezvpn-stop".into())
+            .spawn(teardown)
+        {
+            // No thread available: give up on the graceful close rather than
+            // block the caller (the server falls back to its idle timeout).
+            log::warn!("ezvpn stop: cannot spawn teardown thread ({e}); closing ungracefully");
+        }
     }
 }
 
