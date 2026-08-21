@@ -960,6 +960,7 @@ dependencies = [
  "toml",
  "tun",
  "url",
+ "webpki-roots",
  "windows-sys 0.61.2",
 ]
 

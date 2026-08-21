@@ -8,7 +8,8 @@ debug/release APK built from source.
 The Android client is split across two repositories:
 
 - **This repo (`ezvpn`)** — the Rust core, packaged as `libezvpn.so` per ABI
-  (`arm64-v8a`, `armeabi-v7a`, `x86_64`) plus a small JNI surface. This is
+  (`arm64-v8a`, `armeabi-v7a`, `x86_64`; the app packages only `arm64-v8a`)
+  plus a small JNI surface. This is
   where the Android Rust code, the in-tunnel split-DNS forwarder, and the build
   script live.
 - **[`ezvpn-android`](https://github.com/flexaccessdev/ezvpn-android)** — the
@@ -33,8 +34,7 @@ In scope:
 - **Always-on VPN** — the service accepts the system's always-on start and
   connects the last-used profile.
 - **On-device testing** — developed and tested on an adb-connected arm64
-  Android emulator (a `VpnService` cannot run on the JVM); the physical device
-  only receives the signed release APK.
+  Android emulator (a `VpnService` cannot run on the JVM).
 
 Out of scope (by design):
 
@@ -53,7 +53,7 @@ tun interface, addresses, routes, DNS, and MTU; Rust is handed the fd.
 |---|---|---|
 | TUN device | created by `ezvpn` (`TunDevice::create`) | created by the OS (`Builder.establish()`); `ezvpn` wraps the fd (`TunDevice::from_raw_fd`) |
 | Routing / IP / MTU / DNS | `ip`/`route`/`netsh`, OS resolver config | `VpnService.Builder` (`addAddress`, `addRoute`, `addDnsServer`, `setMtu`) |
-| Underlay bypass | `BypassRouteManager` host routes | no `excludeRoute` before API 33: the app *subtracts* the bypass `/32`s and `/128`s from the routed prefixes (`tunnelcore` `RouteMath.subtract`) and installs the remainder |
+| Underlay bypass | `BypassRouteManager` host routes | `Builder.excludeRoute` for the bypass `/32`s and `/128`s on API 33+; below that the app *subtracts* them from the routed prefixes (`tunnelcore` `RouteMath.subtract`) and installs the remainder |
 | Split DNS | OS conditional forwarding (`docs/Client-Split-DNS.md`) | in-tunnel forwarder (`src/tunnel/dns_proxy.rs`) |
 | Single-instance lock, control socket | yes | not used (one `VpnService`; the app and service share a process) |
 
@@ -104,7 +104,7 @@ The config and result JSON are the shapes documented in
 ezvpn app (Compose)          EzvpnVpnService (same process)
   TunnelsManager.connect ──▶  startService → worker thread:
                                 EzvpnNative.connect(json) ──▶ libezvpn (iroh connect + handshake)
-                                TunnelPlan.from(netConfig)    (tunnelcore: routes − bypass, DNS, families)
+                                TunnelPlan.from(netConfig)    (tunnelcore: routes, bypass, DNS, families)
                                 Builder…establish() → fd
                                 EzvpnNative.run(handle, fd) ─▶ data loop (+ DNS forwarder)
   state: StateFlow  ◀──────── onConnected / onDisconnected
@@ -123,11 +123,13 @@ handshake returns. No foreground notification is used: the system binds the
 
 Same computation as the Apple app: `connect` returns `excluded_routes` /
 `excluded_routes6`, the global-scope relay and server underlay addresses a
-routed prefix would capture. Android's `VpnService.Builder` has no
-`excludeRoute` before API 33 (the app's `minSdk` is 29), so the app subtracts
-those host prefixes from its route list (splitting each containing prefix into
-the sibling prefixes that do not contain the address) and installs the result.
-The detail screen shows both the installed routes and the bypass set.
+routed prefix would capture. On API 33+ the app installs them with
+`VpnService.Builder.excludeRoute`, a throw route inside the routed prefix that
+wins by longest match. Below that (the app's `minSdk` is 29) there is no
+`excludeRoute`, so the app subtracts those host prefixes from its route list
+(splitting each containing prefix into the sibling prefixes that do not
+contain the address — a `/128` out of a `/56` is 72 routes) and installs the
+result. The detail screen shows both the installed routes and the bypass set.
 
 An address family the server did not assign is explicitly `allowFamily`'d:
 a `VpnService` blocks every family it has no address for by default, which is

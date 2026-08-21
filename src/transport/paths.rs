@@ -9,6 +9,7 @@ use futures::future::join_all;
 use iroh::TransportAddr;
 use iroh::endpoint::{Connection, PathList};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
@@ -182,16 +183,24 @@ pub async fn connection_snapshot(
     }
 }
 
-/// Install a process-wide ring crypto provider for `reqwest` (built with
-/// `rustls-no-provider`, which resolves the provider via
-/// [`rustls::crypto::CryptoProvider::get_default`]). Idempotent and safe to call
-/// from any thread; a competing install by another component is fine.
-fn ensure_crypto_provider() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
+/// TLS client config for the `/healthz` probe: ring plus the embedded Mozilla
+/// roots, i.e. exactly what iroh uses to verify the relay's own TLS (its
+/// `platform-verifier` feature is off), so a relay the tunnel trusts is one the
+/// health check trusts. reqwest's own default on the `rustls-no-provider`
+/// feature is `rustls-platform-verifier`, which on Android needs a JNI
+/// initialisation the host app never performs and otherwise panics with
+/// "Expect rustls-platform-verifier to be initialized" while the client is being
+/// built — a panic that aborts the process at the FFI boundary. Handing reqwest
+/// a preconfigured config keeps that verifier out entirely.
+fn healthz_tls_config() -> rustls::ClientConfig {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth()
 }
 
 /// Probe the `/healthz` endpoint of every configured custom relay in parallel.
@@ -201,8 +210,11 @@ pub async fn probe_custom_relay_health(relay_config: &RelayConfig) -> Vec<Custom
     if urls.is_empty() {
         return Vec::new();
     }
-    ensure_crypto_provider();
-    let client = match reqwest::Client::builder().timeout(HEALTHZ_TIMEOUT).build() {
+    let client = match reqwest::Client::builder()
+        .tls_backend_preconfigured(healthz_tls_config())
+        .timeout(HEALTHZ_TIMEOUT)
+        .build()
+    {
         Ok(client) => client,
         Err(e) => {
             let err = format!("failed to build health-check client: {e}");
