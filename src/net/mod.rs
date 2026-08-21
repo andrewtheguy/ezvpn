@@ -2,5 +2,5 @@
 
 pub mod buffer;
 pub mod device;
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub mod local_networks;

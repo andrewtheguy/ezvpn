@@ -277,9 +277,26 @@ When both `network` and `network6` are configured, each client normally receives
 | Windows | `wintun.dll` | `netsh interface route` (VPN routes); `NetTCPIP` PowerShell cmdlets `Find-NetRoute`/`New-NetRoute` (underlay bypass host routes) | Administrator |
 
 The GUI clients build on this same per-platform TUN/route code. On Apple the OS
-hands the extension a `utun` fd (`docs/Apple-App.md`); on Windows the native GUI
-P/Invokes `ezvpn.dll`, which drives the desktop `VpnClient` (wintun + `netsh`)
-in-process (`docs/Windows-App.md`).
+hands the extension a `utun` fd (`docs/Apple-App.md`); on Android the
+`VpnService` hands the core its `establish()`ed tun fd and owns routes/DNS
+itself (`docs/Android-App.md`); on Windows the native GUI P/Invokes
+`ezvpn.dll`, which drives the desktop `VpnClient` (wintun + `netsh`) in-process
+(`docs/Windows-App.md`).
+
+#### Android Split DNS (In-Tunnel Forwarder)
+
+Android's `VpnService` has no per-domain DNS: `addDnsServer` replaces the
+resolvers for every name, and an app cannot bind port 53. The Android app
+therefore implements match domains the way Tailscale's MagicDNS does: the VPN's
+DNS server is a proxy address routed into the tun (`198.18.0.53` /
+`fd7e:7a00:d45::53`), and the client data path (`src/tunnel/dns_proxy.rs`)
+intercepts UDP/53 to it, forwards matched names to the tunnel's resolvers
+(ordinary sockets — the OS routes them back through the tunnel) and everything
+else to the underlying network's resolvers through `protect()`ed sockets the
+service hands over, rewriting DNS ids per in-flight query and writing answers
+back into the tun. TCP SYNs to the proxy's 53/853 get a RST; oversized answers
+are truncated (TC). The hook is a `None` on every non-Android caller of
+`run_tunnel`; the design and limits are in `docs/Android-App.md`.
 
 ### Split-Tunnel Overlap Refusal (Client)
 

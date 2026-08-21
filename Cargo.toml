@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.40"
+version = "0.0.41"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
@@ -12,6 +12,8 @@ name = "ezvpn"
 # staticlib: linked into Apple Network Extensions (iOS and native macOS).
 # cdylib: `ezvpn.dll`, P/Invoked by the native Windows GUI (`ezvpn-windows`)
 #   via the C FFI in `src/ffi_windows.rs`. Built by `build-windows.ps1`.
+#   Also `libezvpn.so` for Android, loaded by the `ezvpn-android` app through
+#   the JNI surface in `src/ffi_android.rs`. Built by `build-android.sh`.
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
@@ -75,10 +77,19 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 # Desktop-only: on-link subnet enumeration for the connect-time split-tunnel
-# overlap refusal (src/net/local_networks.rs). iOS has its own Swift port of
-# this check in ezvpn-apple TunnelCore.
-[target.'cfg(not(target_os = "ios"))'.dependencies]
+# overlap refusal (src/net/local_networks.rs). The mobile apps carry their own
+# ports of this check (ezvpn-apple TunnelCore, ezvpn-android tunnelcore).
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 if-addrs = "0.15"
+
+# Android-only: the JNI bridge for the `ezvpn-android` VpnService, and logcat
+# output for `log` (stderr is discarded on Android).
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+android_logger = "0.15"
+# iroh's Android DNS/interface discovery (hickory-resolver, netwatch) reaches
+# the JVM through this global; the app registers its Context via `EzvpnNative.init`.
+ndk-context = "0.1"
 
 [dev-dependencies]
 mock_instant = "0.6"
