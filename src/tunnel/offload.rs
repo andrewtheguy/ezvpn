@@ -863,11 +863,11 @@ fn tcp_checksum_ipv6(packet: &[u8], tcp_offset: usize) -> Result<u16, String> {
 }
 
 fn add_bytes(mut sum: u32, bytes: &[u8]) -> u32 {
-    let mut chunks = bytes.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum = sum.wrapping_add(u32::from(u16::from_be_bytes([chunk[0], chunk[1]])));
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    for chunk in chunks {
+        sum = sum.wrapping_add(u32::from(u16::from_be_bytes(*chunk)));
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = remainder {
         sum = sum.wrapping_add(u32::from(u16::from_be_bytes([*last, 0])));
     }
     sum
