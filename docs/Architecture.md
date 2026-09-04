@@ -702,6 +702,44 @@ sequenceDiagram
 - Jitter: 0-500ms added to prevent thundering herd
 - Counter reset: Resets to 0 after successful tunnel operation
 
+### Relay Watchdog (Server, Custom Relays)
+
+Implemented in `src/transport/relay_watchdog.rs`, driven by the serve loop in
+`VpnServer::run`. A custom-relay server is dialable from off the LAN only while
+it is **registered on its home relay** (n0 address lookup is off; clients dial
+by relay hint, and a relay forwards QUIC Initials only to endpoints connected to
+it). iroh has been observed to silently lose its home relay for good after a
+routine relay reconnect (relays behind Cloudflare tunnels reset idle WebSockets
+roughly hourly): no dial retries, no warnings, no registration on any relay —
+the server stops being reachable through the relays until the process
+restarts, while LAN clients that find it over mDNS keep working and hide the
+outage. Relay-only clients see connect timeouts.
+
+The watchdog observes `Endpoint::home_relay_status()` and escalates like the
+client's reconnect loop:
+
+1. no connected home relay for `RELAY_OUTAGE_NUDGE` (60s) → log a warning and
+   call `Endpoint::network_change()` (forces a fresh net report and relay
+   re-selection — enough when only the bookkeeping went stale);
+2. still none at `RELAY_OUTAGE_REBUILD` (180s from the outage start) → the
+   serve loop closes the endpoint (bounded by `REBUILD_CLOSE_TIMEOUT`, 5s; a
+   slower close finishes in the background), binds a fresh one with the
+   **same identity** (`server_rebuild_factory`: no per-relay probe, online
+   wait tolerated failing), and accepts on it. The TUN device, address pools,
+   client registries, and status socket carry over; the old endpoint's
+   connections end with it and those clients reconnect on their own. The TUN
+   reader's self-encapsulation filter (the endpoint's local UDP ports) is
+   re-read for the fresh sockets. A failed rebuild is retried every
+   `REBUILD_RETRY` (30s).
+
+A reconnect at any point resets the outage clock. Non-home relays are connected
+on demand and dropped after a minute idle, which is normal and never counts as
+an outage. With the default relays the watchdog is not armed: reachability
+there rests on n0 publishing/resolution, not on one relay registration.
+
+The same watchdog lives in flextunnel (`transport::relay_watchdog`); keep the
+two in sync.
+
 ### Client Network Consistency Check (Reconnect)
 
 On reconnect the client compares the server's network params (`assigned_ip`, `network`, `gateway`, and the IPv6 trio) against the params established on the first successful handshake. A change to *just* the assigned client IP (`assigned_ip` / `assigned_ip6`) is not fatal: the client logs a warning, adopts the new IP as the baseline, and rebuilds the TUN device and routes for the new address (every `connect()` builds these fresh anyway). This is what a server restart that reassigns a different IP looks like. A change to any other field (`network`, `gateway`, or the IPv6 trio) is a fatal `VpnError::ServerConfigChanged` that quits the program instead of reconfiguring into inconsistent routing / TUN state. The stable per-process `device_id` (generated once in `VpnClient::new`) means the server normally re-assigns the same IP, so reassignment is the exception, not the norm. See `check_params_against` / `NetworkParams::non_ip_fields_eq` in `src/tunnel/client.rs`.

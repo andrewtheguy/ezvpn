@@ -721,6 +721,14 @@ The client uses a stable per-process `device_id`, so the server normally assigns
 the same IP during reconnects. Reassignment is expected mainly after server
 restart or allocation state changes.
 
+A **server** with custom relays watches its own home-relay registration: if it
+has no connected home relay for 60s it re-checks the network, and if that has
+not helped by 180s it rebuilds its endpoint in place (same node id) — the
+in-process equivalent of a restart, so relay-only clients (the mobile apps,
+anything off the LAN) are not stranded with connect timeouts until someone
+restarts the service. See
+[`docs/Architecture.md`](docs/Architecture.md#relay-watchdog-server-custom-relays).
+
 ## Relay and Address Lookup
 
 The relay and address-lookup design is shared with

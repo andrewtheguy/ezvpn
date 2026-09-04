@@ -5,7 +5,7 @@ use crate::transport::build_quic_transport_config;
 use crate::tunnel::signaling::VPN_ALPN;
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use futures::future::join_all;
+use futures::future::{BoxFuture, join_all};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
     address_lookup::{DnsAddressLookup, PkarrPublisher},
@@ -319,8 +319,8 @@ async fn probe_custom_relays(relay_config: &RelayConfig) -> Result<()> {
     Ok(())
 }
 
-/// Create the VPN server's iroh endpoint with an optional persistent identity,
-/// waiting for it to come online (bounded by [`RELAY_CONNECT_TIMEOUT`]).
+/// Create the VPN server's iroh endpoint with its persistent identity, waiting
+/// for it to come online (bounded by [`RELAY_CONNECT_TIMEOUT`]).
 ///
 /// A single endpoint serves both relay modes. With the default relays internet
 /// discovery is on, so the server publishes its current home relay and clients
@@ -328,41 +328,80 @@ async fn probe_custom_relays(relay_config: &RelayConfig) -> Result<()> {
 /// its own). With custom relays discovery is off, so clients reach the server
 /// through the relay hints they attach to its `EndpointAddr` (see
 /// [`create_endpoint_builder`]).
-pub async fn create_server_endpoint(
-    relay_config: &RelayConfig,
-    secret: Option<SecretKey>,
-) -> Result<Endpoint> {
+pub async fn create_server_endpoint(relay_config: &RelayConfig, secret: SecretKey) -> Result<Endpoint> {
     print_relay_status(relay_config);
 
     // Validate each custom relay individually (fail if any is unreachable); a
     // no-op for the default relays.
     probe_custom_relays(relay_config).await?;
 
-    let mut builder = create_endpoint_builder(relay_config)?.alpns(vec![VPN_ALPN.to_vec()]);
+    let endpoint = bind_server_endpoint(relay_config, secret).await?;
 
-    if let Some(secret) = secret {
-        builder = builder.secret_key(secret);
+    if let Err(e) = wait_online(&endpoint).await {
+        // Close before propagating: dropping a bound endpoint without
+        // `close()` is fatal under the release profile's panic=abort.
+        endpoint.close().await;
+        return Err(e);
     }
+    Ok(endpoint)
+}
 
-    let endpoint = builder
+/// Bind a server endpoint: persistent identity and the VPN ALPN. No relay
+/// probe, no online wait — [`create_server_endpoint`] and
+/// [`server_rebuild_factory`] layer their own policy over this.
+async fn bind_server_endpoint(relay_config: &RelayConfig, secret: SecretKey) -> Result<Endpoint> {
+    create_endpoint_builder(relay_config)?
+        .alpns(vec![VPN_ALPN.to_vec()])
+        .secret_key(secret)
         .bind()
         .await
-        .context("Failed to create iroh endpoint")?;
+        .context("Failed to create iroh endpoint")
+}
 
-    // Wait for endpoint to come online with timeout
+/// Recipe producing a fresh, fully bound endpoint — how the server replaces a
+/// wedged one mid-run (see `transport::relay_watchdog`).
+pub type EndpointFactory = Arc<dyn Fn() -> BoxFuture<'static, Result<Endpoint>> + Send + Sync>;
+
+/// The rebuild recipe for the server endpoint, used when the relay watchdog
+/// (`transport::relay_watchdog`) gives up on the current one. Same identity as
+/// the original, so the server's node id — what clients dial — never changes.
+/// Differs from first creation in two ways:
+///
+/// - **No per-relay probe.** Creation fails fast if *any* relay is down
+///   (configuration validation); mid-outage that strictness would block
+///   recovery through the one relay that still answers.
+/// - **The online wait is tolerated failing.** A fresh endpoint is no worse
+///   than the wedged one it replaces — LAN clients can still find it over
+///   mDNS — and the watchdog trips again if the relays stay unreachable.
+pub fn server_rebuild_factory(relay_config: RelayConfig, secret: SecretKey) -> EndpointFactory {
+    Arc::new(move || {
+        let relay_config = relay_config.clone();
+        let secret = secret.clone();
+        Box::pin(async move {
+            let endpoint = bind_server_endpoint(&relay_config, secret).await?;
+            if let Err(e) = wait_online(&endpoint).await {
+                log::warn!("Rebuilt endpoint: {e:#}; continuing (LAN discovery still works)");
+            }
+            Ok(endpoint)
+        })
+    })
+}
+
+/// Wait for a freshly bound endpoint to come online, bounded by
+/// [`RELAY_CONNECT_TIMEOUT`]. Does not close the endpoint on failure; the
+/// caller decides (creation closes and fails, a rebuild carries on).
+async fn wait_online(endpoint: &Endpoint) -> Result<()> {
     info!(
         "Waiting for endpoint to come online (timeout: {}s)...",
         RELAY_CONNECT_TIMEOUT.as_secs()
     );
     match tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online()).await {
-        Ok(()) => {}
+        Ok(()) => Ok(()),
         Err(_) => anyhow::bail!(
             "Endpoint failed to come online after {}s - check relay server connectivity",
             RELAY_CONNECT_TIMEOUT.as_secs()
         ),
     }
-
-    Ok(endpoint)
 }
 
 /// Create a client endpoint.
@@ -389,17 +428,11 @@ pub async fn create_client_endpoint(
         .await
         .context("Failed to create iroh endpoint")?;
 
-    // Wait for endpoint to come online with timeout
-    info!(
-        "Waiting for endpoint to come online (timeout: {}s)...",
-        RELAY_CONNECT_TIMEOUT.as_secs()
-    );
-    match tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online()).await {
-        Ok(()) => {}
-        Err(_) => anyhow::bail!(
-            "Endpoint failed to come online after {}s - check relay server connectivity",
-            RELAY_CONNECT_TIMEOUT.as_secs()
-        ),
+    if let Err(e) = wait_online(&endpoint).await {
+        // Close before propagating: dropping a bound endpoint without
+        // `close()` is fatal under the release profile's panic=abort.
+        endpoint.close().await;
+        return Err(e);
     }
 
     Ok(endpoint)

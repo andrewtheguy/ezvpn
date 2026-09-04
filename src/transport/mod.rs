@@ -14,6 +14,7 @@
 
 pub mod endpoint;
 pub mod paths;
+pub mod relay_watchdog;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{AckFrequencyConfig, QuicTransportConfig, VarInt};

@@ -17,6 +17,8 @@ use crate::runtime::{LockRole, VpnLock};
 use crate::tunnel::offload::VirtioNetHdr;
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
 use crate::transport::SERVER_ADDR_PUBLISH_INTERVAL;
+use crate::transport::endpoint::EndpointFactory;
+use crate::transport::relay_watchdog;
 use crate::tunnel::signaling::{
     ClientAuthPayload, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse,
     read_message, write_message,
@@ -32,9 +34,9 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 /// Maximum number of frames drained from a channel per batch.
 const WRITE_BATCH_SIZE: usize = 256;
@@ -753,18 +755,25 @@ impl VpnServer {
     }
 
     /// Run the VPN server, accepting connections via iroh.
-    pub async fn run(mut self, endpoint: Endpoint) -> VpnResult<()> {
+    ///
+    /// `rebuild`, when given, arms the home-relay watchdog
+    /// (`transport::relay_watchdog`): if the endpoint loses its home relay for
+    /// good, the wedged endpoint is closed and `rebuild` binds its replacement
+    /// (same identity), which the server then serves on. Pass `None` for the
+    /// default relays, where reachability does not hang on one relay
+    /// registration.
+    pub async fn run(
+        mut self,
+        endpoint: Endpoint,
+        rebuild: Option<EndpointFactory>,
+    ) -> VpnResult<()> {
         // Setup TUN device
         self.setup_tun().await?;
 
-        // Drop self-encapsulated iroh UDP packets from the VPN tunnel path.
-        let local_iroh_udp_ports = Arc::new(collect_local_iroh_udp_ports(&endpoint));
-        if !local_iroh_udp_ports.is_empty() {
-            log::info!(
-                "Filtering tunneled traffic for {} local iroh UDP port(s)",
-                local_iroh_udp_ports.len()
-            );
-        }
+        // The live endpoint. Swapped by the relay watchdog's rebuild; the TUN
+        // reader (its self-encapsulation filter) and the status socket follow
+        // it through the receiver.
+        let (endpoint_tx, endpoint_rx) = watch::channel(endpoint.clone());
 
         log::info!("VPN Server started:");
         // Log IPv4 info if configured
@@ -864,12 +873,12 @@ impl VpnServer {
         let started_at = Instant::now();
         let node_id = endpoint.id().to_string();
         let status_server = server.clone();
-        let status_endpoint = endpoint.clone();
+        let status_endpoint_rx = endpoint_rx.clone();
         let status_overlay_v4 = server.config.network;
         let status_overlay_v6 = server.config.network6;
         let _status_listener =
             crate::control::spawn_status_listener(LockRole::Server, "default", move || {
-                let status_endpoint = status_endpoint.clone();
+                let status_endpoint = status_endpoint_rx.borrow().clone();
                 let status_server = status_server.clone();
                 let node_id = node_id.clone();
                 async move {
@@ -897,43 +906,56 @@ impl VpnServer {
         // Spawn TUN reader task (reads from TUN, routes to clients)
         // Store JoinHandle for graceful shutdown.
         let server_tun = server.clone();
-        let local_iroh_udp_ports_for_tun = local_iroh_udp_ports.clone();
         let tun_reader_handle = tokio::spawn(async move {
-            if let Err(e) = server_tun
-                .run_tun_reader(tun_reader, local_iroh_udp_ports_for_tun)
-                .await
-            {
+            if let Err(e) = server_tun.run_tun_reader(tun_reader, endpoint_rx).await {
                 log::error!("TUN reader error: {}", e);
             }
         });
 
-        // Accept incoming connections
+        // Serve loop. A pass accepts on the current endpoint until it closes,
+        // or — custom relays only — until the relay watchdog reports the
+        // endpoint has lost its home relay for good. That last case is the
+        // in-process equivalent of the process restart known to fix it: close
+        // the wedged endpoint, bind a fresh one with the same identity, and
+        // serve again. The TUN device, address pools, and client registries
+        // carry over; the old endpoint's connections (and their handler
+        // tasks) end with it, and those clients reconnect on their own.
+        let mut endpoint = endpoint;
         loop {
-            match endpoint.accept().await {
-                Some(incoming) => {
-                    let server = server.clone();
-                    let tun_write_tx = tun_write_tx.clone();
-                    let local_iroh_udp_ports = local_iroh_udp_ports.clone();
-                    let endpoint = endpoint.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = server
-                            .handle_connection(
-                                incoming,
-                                tun_write_tx,
-                                local_iroh_udp_ports,
-                                endpoint,
-                            )
-                            .await
-                        {
-                            log::error!("Connection error: {}", e);
-                        }
-                    });
-                }
-                None => {
+            let outage = tokio::select! {
+                () = server.accept_loop(&endpoint, &tun_write_tx) => {
                     log::info!("Endpoint closed, shutting down");
                     break;
                 }
-            }
+                outage = watch_home_relay_if(rebuild.as_ref(), &endpoint) => outage,
+            };
+            let rebuild = rebuild
+                .as_ref()
+                .expect("watchdog only runs with a rebuild recipe");
+
+            log::error!(
+                "No connected home relay for {:.0}s despite a network re-check; rebuilding the \
+                 endpoint from scratch (server node id stays {})",
+                outage.as_secs_f64(),
+                endpoint.id()
+            );
+            close_endpoint_bounded(endpoint).await;
+            endpoint = loop {
+                match rebuild().await {
+                    Ok(fresh) => break fresh,
+                    Err(e) => {
+                        log::error!(
+                            "Endpoint rebuild failed: {e:#}; retrying in {}s",
+                            REBUILD_RETRY.as_secs()
+                        );
+                        tokio::time::sleep(REBUILD_RETRY).await;
+                    }
+                }
+            };
+            // `send` fails only when every receiver is gone; the TUN reader
+            // holds one for the life of `run`.
+            let _ = endpoint_tx.send(endpoint.clone());
+            log::warn!("Endpoint rebuilt; serving again as {}", endpoint.id());
         }
 
         // Graceful shutdown: drop channel sender to signal TUN writer to exit,
@@ -953,6 +975,39 @@ impl VpnServer {
 
         log::info!("TUN tasks shutdown complete");
         Ok(())
+    }
+
+    /// Accept connections on `endpoint` until it closes. Each connection is
+    /// handled on its own task, holding this endpoint and its local UDP port
+    /// set (the self-encapsulation filter) for the connection's lifetime.
+    async fn accept_loop(
+        self: &Arc<Self>,
+        endpoint: &Endpoint,
+        tun_write_tx: &mpsc::Sender<TunWriteRequest>,
+    ) {
+        // Drop self-encapsulated iroh UDP packets from the VPN tunnel path.
+        let local_iroh_udp_ports = Arc::new(collect_local_iroh_udp_ports(endpoint));
+        if !local_iroh_udp_ports.is_empty() {
+            log::info!(
+                "Filtering tunneled traffic for {} local iroh UDP port(s)",
+                local_iroh_udp_ports.len()
+            );
+        }
+
+        while let Some(incoming) = endpoint.accept().await {
+            let server = self.clone();
+            let tun_write_tx = tun_write_tx.clone();
+            let local_iroh_udp_ports = local_iroh_udp_ports.clone();
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move {
+                if let Err(e) = server
+                    .handle_connection(incoming, tun_write_tx, local_iroh_udp_ports, endpoint)
+                    .await
+                {
+                    log::error!("Connection error: {}", e);
+                }
+            });
+        }
     }
 
     /// Verify a client's public-key credential: the claimed endpoint id must
@@ -1712,12 +1767,18 @@ impl VpnServer {
     /// destination client as one or more unreliable QUIC datagrams (offload
     /// super-frames are software-segmented into per-MSS datagrams). Software GRO
     /// coalescing is gone: a datagram can only carry a single MTU-sized packet.
+    ///
+    /// `endpoint_rx` carries the live endpoint; its local UDP port set (the
+    /// self-encapsulation filter) is re-read whenever the relay watchdog
+    /// rebuilds the endpoint, which binds fresh sockets on fresh ports.
     async fn run_tun_reader(
         &self,
         mut tun_reader: crate::net::device::TunReader,
-        local_iroh_udp_ports: Arc<HashSet<u16>>,
+        mut endpoint_rx: watch::Receiver<Endpoint>,
     ) -> VpnResult<()> {
         log::info!("TUN reader started");
+
+        let mut local_iroh_udp_ports = collect_local_iroh_udp_ports(&endpoint_rx.borrow_and_update());
 
         let buffer_size = tun_reader.buffer_size();
         let mut read_storage = uninitialized_vec(buffer_size);
@@ -1745,6 +1806,18 @@ impl VpnServer {
 
             let raw_frame = packet_buf.filled();
             self.stats.tun_packets_read.fetch_add(1, Ordering::Relaxed);
+
+            // One atomic load per packet; the set itself is only rebuilt when
+            // the endpoint was. `Err` means the sender is gone (`run` is
+            // ending), which changes nothing here.
+            if endpoint_rx.has_changed().unwrap_or(false) {
+                local_iroh_udp_ports =
+                    collect_local_iroh_udp_ports(&endpoint_rx.borrow_and_update());
+                log::info!(
+                    "Filtering tunneled traffic for {} local iroh UDP port(s) of the rebuilt endpoint",
+                    local_iroh_udp_ports.len()
+                );
+            }
 
             let (offload, packet_ref) = match tun_reader.split_frame(raw_frame) {
                 Ok(parts) => parts,
@@ -1947,6 +2020,41 @@ fn read_ipv6_addr(packet: &[u8], offset: usize) -> Ipv6Addr {
 /// Collect local UDP ports bound by the iroh endpoint.
 fn collect_local_iroh_udp_ports(endpoint: &Endpoint) -> HashSet<u16> {
     endpoint.addr().ip_addrs().map(|addr| addr.port()).collect()
+}
+
+/// Pause between attempts to bind a replacement endpoint after the relay
+/// watchdog retired the old one and the rebuild itself failed (e.g. no route
+/// to bind on). The server has no endpoint at all during this wait, so it is
+/// short — there is nothing to lose by trying again soon.
+const REBUILD_RETRY: Duration = Duration::from_secs(30);
+
+/// Bound wait on the old endpoint's graceful close during a rebuild. The close
+/// runs as its own task and is never cancelled (dropping a bound endpoint
+/// without `close()` is fatal under the release profile's panic=abort); the
+/// bound only keeps the serve loop from stalling behind it, letting a slow
+/// close finish in the background while the replacement is bound.
+const REBUILD_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The relay watchdog for one serve pass: pending forever when no rebuild
+/// recipe was given (default relays), otherwise resolves with the outage
+/// duration once the endpoint should be replaced.
+async fn watch_home_relay_if(rebuild: Option<&EndpointFactory>, endpoint: &Endpoint) -> Duration {
+    match rebuild {
+        Some(_) => relay_watchdog::watch_home_relay(endpoint).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Close a retired endpoint, waiting at most [`REBUILD_CLOSE_TIMEOUT`] for it;
+/// a slower close carries on in its own task.
+async fn close_endpoint_bounded(endpoint: Endpoint) {
+    let close = tokio::spawn(async move { endpoint.close().await });
+    if tokio::time::timeout(REBUILD_CLOSE_TIMEOUT, close).await.is_err() {
+        log::warn!(
+            "Old endpoint is taking more than {}s to close; continuing in the background",
+            REBUILD_CLOSE_TIMEOUT.as_secs()
+        );
+    }
 }
 
 /// The server's candidate iroh underlay addresses (deduped, sorted): the set it
