@@ -1046,7 +1046,7 @@ async fn run_vpn_client(
 
     // Create iroh endpoint for signaling (ephemeral identity - no persistent
     // secret key).
-    let endpoint = create_client_endpoint(&resolved.relay_config, None)
+    let endpoint = create_client_endpoint(&resolved.relay_config)
         .await
         .context("Failed to create iroh endpoint")?;
 

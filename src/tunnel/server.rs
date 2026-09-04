@@ -18,7 +18,7 @@ use crate::tunnel::offload::VirtioNetHdr;
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
 use crate::transport::SERVER_ADDR_PUBLISH_INTERVAL;
 use crate::transport::endpoint::EndpointFactory;
-use crate::transport::relay_watchdog::{self, RelayOutage};
+use flexaccess_iroh::relay_watchdog::{self, RelayOutage};
 use crate::tunnel::signaling::{
     ClientAuthPayload, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse,
     read_message, write_message,
@@ -757,7 +757,7 @@ impl VpnServer {
     /// Run the VPN server, accepting connections via iroh.
     ///
     /// `rebuild`, when given, arms the home-relay watchdog
-    /// (`transport::relay_watchdog`): if the endpoint loses its home relay for
+    /// (`flexaccess_iroh::relay_watchdog`): if the endpoint loses its home relay for
     /// good, the wedged endpoint is closed and `rebuild` binds its replacement
     /// (same identity), which the server then serves on. Pass `None` for the
     /// default relays, where reachability does not hang on one relay

@@ -138,7 +138,7 @@ impl MobileSession {
     /// so the server may assign a different IP on each connect — acceptable for
     /// the MVP.
     pub async fn connect(cfg: MobileConfig) -> VpnResult<Self> {
-        let endpoint = create_client_endpoint(&cfg.relay_config, None)
+        let endpoint = create_client_endpoint(&cfg.relay_config)
             .await
             .map_err(|e| VpnError::Signaling(format!("Failed to create iroh endpoint: {e}")))?;
 

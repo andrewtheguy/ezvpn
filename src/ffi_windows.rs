@@ -317,7 +317,7 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
             };
 
             runtime.block_on(async move {
-                let endpoint = match create_client_endpoint(&relay_config, None).await {
+                let endpoint = match create_client_endpoint(&relay_config).await {
                     Ok(e) => e,
                     Err(e) => {
                         let _ = setup_tx.send(Err(format!("failed to create iroh endpoint: {e}")));

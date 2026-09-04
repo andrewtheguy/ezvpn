@@ -934,6 +934,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "etherparse",
+ "flexaccess-iroh",
  "flexaccess-keys",
  "futures",
  "if-addrs",
@@ -993,6 +994,21 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "flexaccess-iroh"
+version = "0.0.3"
+source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.3#422dacee5b38a667bd6da2b709d28d86c8d7661f"
+dependencies = [
+ "anyhow",
+ "base64",
+ "flexaccess-keys",
+ "futures",
+ "iroh",
+ "log",
+ "rustls",
+ "tokio",
+]
 
 [[package]]
 name = "flexaccess-keys"

@@ -812,7 +812,7 @@ pub(crate) async fn perform_handshake(
         ClientAuthPayload {
             public_key: client_key.public_str(),
             endpoint_id: own_id.to_string(),
-            signature: client_key.sign_endpoint_id(&own_id),
+            signature: crate::auth::sign_endpoint_id(client_key, &own_id),
         },
     );
 
