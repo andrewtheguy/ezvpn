@@ -26,7 +26,7 @@ use ezvpn::config::file_config::{
 };
 use ezvpn::runtime::LockRole;
 use ezvpn::transport::endpoint::{
-    create_client_endpoint, create_server_endpoint, load_secret, server_rebuild_factory,
+    create_client_endpoint, create_server_endpoint, load_secret,
 };
 use ezvpn::transport::{
     CongestionConfig, CongestionControl, parse_congestion_initial_window, set_congestion_config,
@@ -953,18 +953,9 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
     // for VPN traffic; relays are only the automatic fallback when a direct
     // connection fails. A single endpoint serves both relay modes; internet
     // discovery follows the mode (on for default relays, off for custom).
-    let endpoint = create_server_endpoint(&resolved.relay_config, secret_key.clone())
+    let endpoint = create_server_endpoint(&resolved.relay_config, secret_key)
         .await
         .context("Failed to create iroh endpoint")?;
-    // The relay watchdog's remedy of last resort: a fresh endpoint with the
-    // same identity. Only a custom-relay server hangs its reachability on one
-    // home-relay registration (n0 discovery is off, clients dial by relay
-    // hint), so the watchdog is armed for custom relays only.
-    let rebuild = resolved
-        .relay_config
-        .is_custom()
-        .then(|| server_rebuild_factory(resolved.relay_config.clone(), secret_key));
-
     log::info!("VPN Server Node ID: {}", endpoint.id());
     log::info!(
         "Clients connect with: ezvpn client start --server-node-id {} --auth-key-file <KEY FILE>",
@@ -977,7 +968,7 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         .context("Failed to create VPN server")?;
 
     server
-        .run(endpoint, rebuild)
+        .run(endpoint)
         .await
         .map_err(|e| anyhow::anyhow!("VPN server error: {}", e))
 }

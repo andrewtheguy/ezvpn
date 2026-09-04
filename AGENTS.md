@@ -23,7 +23,7 @@ https://github.com/flexaccessdev/iroh-common-architecture. Do not duplicate it i
 this repo; update it there and link to it.
 
 That shared layer's code — `RelayConfig` and the relay probe, endpoint
-building and rebuild, the home-relay watchdog, the endpoint-bound auth
+building and rebuild, the endpoint-bound auth
 transcript — lives in the `flexaccess-iroh` crate (`../flexaccess-iroh`,
 consumed by git tag). Fix it there, tag a release, and bump the tag here; never
 re-implement or fork a copy of it in this repo. Only ezvpn-specific pieces (the

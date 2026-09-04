@@ -702,54 +702,12 @@ sequenceDiagram
 - Jitter: 0-500ms added to prevent thundering herd
 - Counter reset: Resets to 0 after successful tunnel operation
 
-### Relay Watchdog (Server, Custom Relays)
+### Server relay recovery
 
-Implemented in the shared
-[flexaccess-iroh](https://github.com/flexaccessdev/flexaccess-iroh) crate
-(`flexaccess_iroh::relay_watchdog`), driven by the serve loop in
-`VpnServer::run`. A custom-relay server is dialable from off the LAN only while
-it is **registered on its home relay** (n0 address lookup is off; clients dial
-by relay hint, and a relay forwards QUIC Initials only to endpoints connected to
-it). iroh has been observed to silently lose its home relay for good after a
-routine relay reconnect (relays behind Cloudflare tunnels reset idle WebSockets
-roughly hourly): no dial retries, no warnings, no registration on any relay —
-the server stops being reachable through the relays until the process
-restarts, while LAN clients that find it over mDNS keep working and hide the
-outage. Relay-only clients see connect timeouts.
-
-The watchdog observes `Endpoint::home_relay_status()` and escalates like the
-client's reconnect loop:
-
-1. no connected home relay for `RELAY_OUTAGE_NUDGE` (60s) → log a warning and
-   call `Endpoint::network_change()` (forces a fresh net report and relay
-   re-selection — enough when only the bookkeeping went stale);
-2. still none at `RELAY_OUTAGE_REBUILD` (180s from the outage start) → the
-   serve loop closes the endpoint (bounded by `REBUILD_CLOSE_TIMEOUT`, 5s; a
-   slower close finishes in the background), binds a fresh one with the
-   **same identity** (`server_rebuild_factory`: no per-relay probe, online
-   wait tolerated failing), and accepts on it. The TUN device, address pools,
-   client registries, and status socket carry over; the old endpoint's
-   connections end with it and those clients reconnect on their own. The TUN
-   reader's self-encapsulation filter (the endpoint's local UDP ports) is
-   re-read for the fresh sockets. A failed rebuild is retried every
-   `REBUILD_RETRY` (30s).
-
-A rebuild only helps when iroh's bookkeeping went stale; when the relay itself
-is unreachable the fresh endpoint never registers either, and rebuilding again
-every three minutes would keep dropping the LAN clients that still work. The
-watchdog therefore reports whether the endpoint held a home relay at any point
-(`RelayOutage::relay_seen`), and the serve loop doubles the rebuild deadline
-for each consecutive endpoint that never did (`rebuild_deadline`: 180s, 6m,
-12m, 24m, then capped at `REBUILD_DEADLINE_MAX`, 30m). An endpoint that
-registers resets the escalation to the usual 180s. The 60s nudge is unaffected.
-
-A reconnect at any point resets the outage clock. Non-home relays are connected
-on demand and dropped after a minute idle, which is normal and never counts as
-an outage. With the default relays the watchdog is not armed: reachability
-there rests on n0 publishing/resolution, not on one relay registration.
-
-The watchdog is shared with flextunnel through that crate: fix it there, tag a
-release, and bump the tag here.
+Servers rely on iroh 1.1.x for relay reconnects and keep the same endpoint
+during relay outages. The former server watchdog has been removed; see the
+[relay recovery history and workaround](https://github.com/flexaccessdev/iroh-common-architecture/blob/9eacd43b80d867a8a4a76e3051237b854b4b0cd5/home-relay-watchdog.md)
+if permanent loss of relay registration recurs.
 
 ### Client Network Consistency Check (Reconnect)
 

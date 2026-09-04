@@ -721,13 +721,10 @@ The client uses a stable per-process `device_id`, so the server normally assigns
 the same IP during reconnects. Reassignment is expected mainly after server
 restart or allocation state changes.
 
-A **server** with custom relays watches its own home-relay registration: if it
-has no connected home relay for 60s it re-checks the network, and if that has
-not helped by 180s it rebuilds its endpoint in place (same node id) — the
-in-process equivalent of a restart, so relay-only clients (the mobile apps,
-anything off the LAN) are not stranded with connect timeouts until someone
-restarts the service. See
-[`docs/Architecture.md`](docs/Architecture.md#relay-watchdog-server-custom-relays).
+Servers rely on iroh 1.1.x for relay reconnects and keep the same endpoint
+during relay outages. The former server watchdog has been removed; see the
+[relay recovery history and workaround](https://github.com/flexaccessdev/iroh-common-architecture/blob/9eacd43b80d867a8a4a76e3051237b854b4b0cd5/home-relay-watchdog.md)
+if permanent loss of relay registration recurs.
 
 ## Relay and Address Lookup
 
