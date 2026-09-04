@@ -732,6 +732,15 @@ client's reconnect loop:
    re-read for the fresh sockets. A failed rebuild is retried every
    `REBUILD_RETRY` (30s).
 
+A rebuild only helps when iroh's bookkeeping went stale; when the relay itself
+is unreachable the fresh endpoint never registers either, and rebuilding again
+every three minutes would keep dropping the LAN clients that still work. The
+watchdog therefore reports whether the endpoint held a home relay at any point
+(`RelayOutage::relay_seen`), and the serve loop doubles the rebuild deadline
+for each consecutive endpoint that never did (`rebuild_deadline`: 180s, 6m,
+12m, 24m, then capped at `REBUILD_DEADLINE_MAX`, 30m). An endpoint that
+registers resets the escalation to the usual 180s. The 60s nudge is unaffected.
+
 A reconnect at any point resets the outage clock. Non-home relays are connected
 on demand and dropped after a minute idle, which is normal and never counts as
 an outage. With the default relays the watchdog is not armed: reachability

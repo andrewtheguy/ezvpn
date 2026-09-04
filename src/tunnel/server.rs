@@ -18,7 +18,7 @@ use crate::tunnel::offload::VirtioNetHdr;
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
 use crate::transport::SERVER_ADDR_PUBLISH_INTERVAL;
 use crate::transport::endpoint::EndpointFactory;
-use crate::transport::relay_watchdog;
+use crate::transport::relay_watchdog::{self, RelayOutage};
 use crate::tunnel::signaling::{
     ClientAuthPayload, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse,
     read_message, write_message,
@@ -920,25 +920,47 @@ impl VpnServer {
         // serve again. The TUN device, address pools, and client registries
         // carry over; the old endpoint's connections (and their handler
         // tasks) end with it, and those clients reconnect on their own.
+        //
+        // A rebuild only helps when iroh's relay bookkeeping went stale. When
+        // the relay itself is unreachable the fresh endpoint never registers
+        // either, and rebuilding it again every few minutes would keep
+        // dropping the LAN clients that still work. So consecutive endpoints
+        // that never saw a home relay lengthen the watchdog's deadline
+        // (`rebuild_deadline`); one that did register resets the escalation.
         let mut endpoint = endpoint;
+        let mut unregistered_endpoints: u32 = 0;
         loop {
+            let deadline = rebuild_deadline(unregistered_endpoints);
             let outage = tokio::select! {
                 () = server.accept_loop(&endpoint, &tun_write_tx) => {
                     log::info!("Endpoint closed, shutting down");
                     break;
                 }
-                outage = watch_home_relay_if(rebuild.as_ref(), &endpoint) => outage,
+                outage = watch_home_relay_if(rebuild.as_ref(), &endpoint, deadline) => outage,
             };
             let rebuild = rebuild
                 .as_ref()
                 .expect("watchdog only runs with a rebuild recipe");
 
+            unregistered_endpoints = if outage.relay_seen {
+                0
+            } else {
+                unregistered_endpoints + 1
+            };
             log::error!(
                 "No connected home relay for {:.0}s despite a network re-check; rebuilding the \
                  endpoint from scratch (server node id stays {})",
-                outage.as_secs_f64(),
+                outage.duration.as_secs_f64(),
                 endpoint.id()
             );
+            if unregistered_endpoints > 0 {
+                log::error!(
+                    "{unregistered_endpoints} endpoint(s) in a row never registered on any home \
+                     relay; the relay itself is probably unreachable. If the rebuilt endpoint \
+                     does not register either, the next rebuild waits {}s",
+                    rebuild_deadline(unregistered_endpoints).as_secs()
+                );
+            }
             close_endpoint_bounded(endpoint).await;
             endpoint = loop {
                 match rebuild().await {
@@ -2028,6 +2050,22 @@ fn collect_local_iroh_udp_ports(endpoint: &Endpoint) -> HashSet<u16> {
 /// short — there is nothing to lose by trying again soon.
 const REBUILD_RETRY: Duration = Duration::from_secs(30);
 
+/// Cap on the watchdog's rebuild deadline once consecutive rebuilt endpoints
+/// keep failing to register on any home relay.
+const REBUILD_DEADLINE_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// The watchdog's rebuild deadline for the next serve pass, given how many
+/// endpoints in a row never registered on a home relay: the usual
+/// [`relay_watchdog::RELAY_OUTAGE_REBUILD`] after an endpoint that did
+/// register, doubling per unregistered endpoint up to [`REBUILD_DEADLINE_MAX`]
+/// (180s, 6m, 12m, 24m, 30m). Rebuilding while the relay itself is down
+/// gains nothing and drops every LAN client, so it is done less and less
+/// often; a relay that comes back resets the escalation.
+fn rebuild_deadline(unregistered_endpoints: u32) -> Duration {
+    let factor = 1u32 << unregistered_endpoints.min(4);
+    (relay_watchdog::RELAY_OUTAGE_REBUILD * factor).min(REBUILD_DEADLINE_MAX)
+}
+
 /// Bound wait on the old endpoint's graceful close during a rebuild. The close
 /// runs as its own task and is never cancelled (dropping a bound endpoint
 /// without `close()` is fatal under the release profile's panic=abort); the
@@ -2036,11 +2074,15 @@ const REBUILD_RETRY: Duration = Duration::from_secs(30);
 const REBUILD_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The relay watchdog for one serve pass: pending forever when no rebuild
-/// recipe was given (default relays), otherwise resolves with the outage
-/// duration once the endpoint should be replaced.
-async fn watch_home_relay_if(rebuild: Option<&EndpointFactory>, endpoint: &Endpoint) -> Duration {
+/// recipe was given (default relays), otherwise resolves once the endpoint
+/// has had no home relay for `rebuild_after` and should be replaced.
+async fn watch_home_relay_if(
+    rebuild: Option<&EndpointFactory>,
+    endpoint: &Endpoint,
+    rebuild_after: Duration,
+) -> RelayOutage {
     match rebuild {
-        Some(_) => relay_watchdog::watch_home_relay(endpoint).await,
+        Some(_) => relay_watchdog::watch_home_relay(endpoint, rebuild_after).await,
         None => std::future::pending().await,
     }
 }
@@ -2249,6 +2291,17 @@ fn extract_udp_ports(packet: &[u8]) -> Option<(u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebuild_deadline_doubles_per_unregistered_endpoint_up_to_the_cap() {
+        let base = relay_watchdog::RELAY_OUTAGE_REBUILD;
+        assert_eq!(rebuild_deadline(0), base);
+        assert_eq!(rebuild_deadline(1), base * 2);
+        assert_eq!(rebuild_deadline(2), base * 4);
+        assert_eq!(rebuild_deadline(3), base * 8);
+        assert_eq!(rebuild_deadline(4), REBUILD_DEADLINE_MAX);
+        assert_eq!(rebuild_deadline(50), REBUILD_DEADLINE_MAX);
+    }
 
     /// Helper to create a random EndpointId for testing
     fn random_endpoint_id() -> EndpointId {
