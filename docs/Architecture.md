@@ -704,7 +704,9 @@ sequenceDiagram
 
 ### Relay Watchdog (Server, Custom Relays)
 
-Implemented in `src/transport/relay_watchdog.rs`, driven by the serve loop in
+Implemented in the shared
+[flexaccess-iroh](https://github.com/flexaccessdev/flexaccess-iroh) crate
+(`flexaccess_iroh::relay_watchdog`), driven by the serve loop in
 `VpnServer::run`. A custom-relay server is dialable from off the LAN only while
 it is **registered on its home relay** (n0 address lookup is off; clients dial
 by relay hint, and a relay forwards QUIC Initials only to endpoints connected to
@@ -746,8 +748,8 @@ on demand and dropped after a minute idle, which is normal and never counts as
 an outage. With the default relays the watchdog is not armed: reachability
 there rests on n0 publishing/resolution, not on one relay registration.
 
-The same watchdog lives in flextunnel (`transport::relay_watchdog`); keep the
-two in sync.
+The watchdog is shared with flextunnel through that crate: fix it there, tag a
+release, and bump the tag here.
 
 ### Client Network Consistency Check (Reconnect)
 

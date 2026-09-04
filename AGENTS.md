@@ -22,6 +22,16 @@ self-hosting — is documented once in
 https://github.com/flexaccessdev/iroh-common-architecture. Do not duplicate it in
 this repo; update it there and link to it.
 
+That shared layer's code — `RelayConfig` and the relay probe, endpoint
+building and rebuild, the home-relay watchdog, the endpoint-bound auth
+transcript — lives in the `flexaccess-iroh` crate (`../flexaccess-iroh`,
+consumed by git tag). Fix it there, tag a release, and bump the tag here; never
+re-implement or fork a copy of it in this repo. Only ezvpn-specific pieces (the
+VPN ALPN, QUIC transport tuning, the auth context, the bounded connect, key
+files) belong in `src/transport/` and `src/auth.rs`. ezvpn depends on a fork of
+iroh, so the fork is applied through `[patch.crates-io]` in `Cargo.toml` rather
+than as a git dependency, so that the shared crate's `iroh` resolves to it too.
+
 The mobile apps live in sibling repos: `../ezvpn-apple` (Swift, see
 `docs/Apple-App.md`) and `../ezvpn-android` (Kotlin, see `docs/Android-App.md`).
 Both drive the fd-based `MobileSession` in `src/tunnel/mobile.rs` through

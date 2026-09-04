@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.45"
+version = "0.0.46"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
@@ -31,10 +31,13 @@ etherparse = "0.20"
 flexaccess-keys = { git = "https://github.com/flexaccessdev/flexaccess-keys", tag = "v0.0.2", default-features = false }
 futures = "0.3"
 ipnet = { version = "2", features = ["serde"] }
-# Forked from iroh v1.1.0. This branch preserves established-path transport
-# backpressure so noq retains and retries the transmit instead of treating a
-# local discard as successful. Cargo.lock pins the tested branch commit.
-iroh = { version = "=1.1.0", git = "https://github.com/andrewtheguy/iroh.git", branch = "ezvpn-send-backpressure-1.1.0" }
+# Shared iroh transport layer (RelayConfig + per-relay probe, endpoint
+# build/rebuild, home-relay watchdog, endpoint-bound auth transcript). No
+# `mdns` feature: ezvpn runs no local-network discovery.
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.3" }
+# Redirected to the fork below via `[patch.crates-io]`, which also covers the
+# shared crate's own `iroh` dependency so the graph holds a single `iroh`.
+iroh = "1.1.0"
 noq-proto = "1.2.0"
 n0-watcher = "1.0.0"
 log = "0.4"
@@ -105,3 +108,11 @@ strip = true
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# Forked from iroh v1.1.0. This branch preserves established-path transport
+# backpressure so noq retains and retries the transmit instead of treating a
+# local discard as successful. Cargo.lock pins the tested branch commit. A
+# patch rather than a git dependency so `flexaccess-iroh`'s `iroh` resolves to
+# the same package (see its README, "Consumers on a fork of iroh").
+[patch.crates-io]
+iroh = { git = "https://github.com/andrewtheguy/iroh.git", branch = "ezvpn-send-backpressure-1.1.0" }
