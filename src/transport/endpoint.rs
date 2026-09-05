@@ -2,7 +2,7 @@
 //! [`flexaccess_iroh::endpoint`] builder — the VPN ALPN, its QUIC transport
 //! tuning, the client/server identity rules, the bounded connect, and the
 //! server's secret-key file. Relay configuration, the per-relay startup probe,
-//! and the creation-vs-rebuild policy come from the shared crate.
+//! and the bind-and-come-online policy come from the shared crate.
 
 use crate::error::{VpnError, VpnResult};
 use crate::transport::build_quic_transport_config;
@@ -10,17 +10,15 @@ use crate::tunnel::signaling::VPN_ALPN;
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use flexaccess_iroh::endpoint::{
-    EndpointOptions, create_endpoint, endpoint_builder, rebuild_endpoint,
+    CreatedEndpoint, EndpointOptions, create_endpoint, endpoint_builder,
 };
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey,
     endpoint::{Builder as EndpointBuilder, Connection},
 };
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
-pub use flexaccess_iroh::endpoint::EndpointFactory;
 pub use flexaccess_iroh::relay::RelayConfig;
 
 /// Deadline for establishing the QUIC connection to the VPN server.
@@ -96,9 +94,7 @@ fn base_builder(relay_config: &RelayConfig, publish_address: bool) -> Result<End
 }
 
 /// A server endpoint builder: persistent identity (published on the default
-/// relays) and the VPN ALPN. Binding policy is the caller's —
-/// [`create_server_endpoint`] and [`server_rebuild_factory`] each layer their
-/// own.
+/// relays) and the VPN ALPN.
 fn server_builder(relay_config: &RelayConfig, secret: SecretKey) -> Result<EndpointBuilder> {
     Ok(base_builder(relay_config, true)?
         .alpns(vec![VPN_ALPN.to_vec()])
@@ -112,30 +108,25 @@ fn server_builder(relay_config: &RelayConfig, secret: SecretKey) -> Result<Endpo
 /// resolve it by endpoint ID (iroh's relay failover re-homes and republishes on
 /// its own). With custom relays discovery is off, so clients reach the server
 /// through the relay hints they attach to its `EndpointAddr` (see
-/// `VpnClient::resolve_server_addr`). Strict first-creation policy: every
-/// custom relay is probed and the endpoint must come online.
-pub async fn create_server_endpoint(relay_config: &RelayConfig, secret: SecretKey) -> Result<Endpoint> {
+/// `VpnClient::resolve_server_addr`). Every custom relay is probed (startup
+/// fails only if none answers), the endpoint is bound without the relays that
+/// failed and must come online. The relays left out come back in
+/// [`CreatedEndpoint::relays_left_out`] for the home-relay failover
+/// (`VpnServer::run`) to restore once they are connectable.
+pub async fn create_server_endpoint(
+    relay_config: &RelayConfig,
+    secret: SecretKey,
+) -> Result<CreatedEndpoint> {
     create_endpoint(relay_config, server_builder(relay_config, secret)?).await
-}
-
-/// The rebuild recipe for the server endpoint, used when the relay watchdog
-/// (`flexaccess_iroh::relay_watchdog`) gives up on the current one. Same
-/// identity as the original, so the server's node id — what clients dial —
-/// never changes. Tolerant rebuild policy (see [`rebuild_endpoint`]): no
-/// relay probe, and the online wait may fail — the watchdog trips again if the
-/// relays stay unreachable, with a lengthening deadline so a dead relay does
-/// not churn the endpoint every few minutes (see `VpnServer::run`).
-pub fn server_rebuild_factory(relay_config: RelayConfig, secret: SecretKey) -> EndpointFactory {
-    Arc::new(move || {
-        let relay_config = relay_config.clone();
-        let secret = secret.clone();
-        Box::pin(async move { rebuild_endpoint(server_builder(&relay_config, secret)?).await })
-    })
 }
 
 /// Create a client endpoint: ephemeral identity, never published (the client
 /// only dials out; its credential is the auth keypair, not the endpoint id).
-/// Strict first-creation policy.
+/// Same relay probe and online wait as the server. A relay that failed the
+/// probe stays out for the client's lifetime: it lives one session and runs
+/// no failover.
 pub async fn create_client_endpoint(relay_config: &RelayConfig) -> Result<Endpoint> {
-    create_endpoint(relay_config, base_builder(relay_config, false)?).await
+    let CreatedEndpoint { endpoint, .. } =
+        create_endpoint(relay_config, base_builder(relay_config, false)?).await?;
+    Ok(endpoint)
 }

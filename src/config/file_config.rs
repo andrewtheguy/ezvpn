@@ -48,6 +48,9 @@ pub struct ServerAuthConfig {
 #[serde(deny_unknown_fields)]
 pub struct VpnServerIrohConfig {
     pub secret_file: Option<PathBuf>,
+    /// Custom relay server URLs. At least two distinct relays: a server keeps
+    /// working through a relay outage by moving onto another configured relay,
+    /// so one relay is rejected. Both sides must list the full set.
     pub relay_urls: Option<Vec<String>>,
     /// Optional shared bearer token sent to the custom relays as
     /// `Authorization: Bearer <token>`. Only valid together with `relay_urls`.
@@ -77,6 +80,9 @@ pub struct ClientAuthConfig {
 #[serde(deny_unknown_fields)]
 pub struct VpnClientIrohConfig {
     pub server_node_id: Option<String>,
+    /// Custom relay server URLs. At least two distinct relays: a server keeps
+    /// working through a relay outage by moving onto another configured relay,
+    /// so one relay is rejected. Both sides must list the full set.
     pub relay_urls: Option<Vec<String>>,
     /// Optional shared bearer token sent to the custom relays as
     /// `Authorization: Bearer <token>`. Only valid together with `relay_urls`.
@@ -629,7 +635,7 @@ auth_key_file = "./client.key"
 
 [iroh]
 server_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
-relay_urls = ["https://relay.example.com"]
+relay_urls = ["https://relay.example.com", "https://relay2.example.com"]
 "#,
         )
         .unwrap();
@@ -640,7 +646,12 @@ relay_urls = ["https://relay.example.com"]
         let iroh = config.iroh.as_ref().unwrap();
         assert_eq!(
             iroh.relay_urls.as_deref(),
-            Some(&["https://relay.example.com".to_string()][..])
+            Some(
+                &[
+                    "https://relay.example.com".to_string(),
+                    "https://relay2.example.com".to_string()
+                ][..]
+            )
         );
 
         let resolved = VpnClientConfigBuilder::new()
@@ -650,9 +661,13 @@ relay_urls = ["https://relay.example.com"]
             .unwrap();
         assert_eq!(
             resolved.relay_config,
-            RelayConfig::from_urls(&["https://relay.example.com".to_string()]).unwrap()
+            RelayConfig::from_urls(&[
+                "https://relay.example.com".to_string(),
+                "https://relay2.example.com".to_string()
+            ])
+            .unwrap()
         );
-        assert_eq!(resolved.relay_config.custom_urls().len(), 1);
+        assert_eq!(resolved.relay_config.custom_urls().len(), 2);
     }
 
     #[test]
@@ -663,7 +678,7 @@ role = "vpnclient"
 
 [iroh]
 server_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
-relay_urls = ["https://relay.example.com"]
+relay_urls = ["https://relay.example.com", "https://relay2.example.com"]
 relay_auth_token = "shared-secret"
 "#,
         )

@@ -25,9 +25,8 @@ use ezvpn::config::file_config::{
     load_vpn_client_config, load_vpn_server_config,
 };
 use ezvpn::runtime::LockRole;
-use ezvpn::transport::endpoint::{
-    create_client_endpoint, create_server_endpoint, load_secret, server_rebuild_factory,
-};
+use ezvpn::transport::endpoint::{create_client_endpoint, create_server_endpoint, load_secret};
+use flexaccess_iroh::endpoint::CreatedEndpoint;
 use ezvpn::transport::{
     CongestionConfig, CongestionControl, parse_congestion_initial_window, set_congestion_config,
 };
@@ -182,7 +181,8 @@ enum ClientAction {
         #[arg(short = 'n', long)]
         server_node_id: Option<String>,
 
-        /// Custom relay server URL(s)
+        /// Custom relay server URLs (at least two, for failover); the server
+        /// moves onto another one when its home relay is lost
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
 
@@ -953,17 +953,10 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
     // for VPN traffic; relays are only the automatic fallback when a direct
     // connection fails. A single endpoint serves both relay modes; internet
     // discovery follows the mode (on for default relays, off for custom).
-    let endpoint = create_server_endpoint(&resolved.relay_config, secret_key.clone())
-        .await
-        .context("Failed to create iroh endpoint")?;
-    // The relay watchdog's remedy of last resort: a fresh endpoint with the
-    // same identity. Only a custom-relay server hangs its reachability on one
-    // home-relay registration (n0 discovery is off, clients dial by relay
-    // hint), so the watchdog is armed for custom relays only.
-    let rebuild = resolved
-        .relay_config
-        .is_custom()
-        .then(|| server_rebuild_factory(resolved.relay_config.clone(), secret_key));
+    let CreatedEndpoint { endpoint, relays_left_out } =
+        create_server_endpoint(&resolved.relay_config, secret_key)
+            .await
+            .context("Failed to create iroh endpoint")?;
 
     log::info!("VPN Server Node ID: {}", endpoint.id());
     log::info!(
@@ -977,7 +970,7 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         .context("Failed to create VPN server")?;
 
     server
-        .run(endpoint, rebuild)
+        .run(endpoint, &resolved.relay_config, &relays_left_out)
         .await
         .map_err(|e| anyhow::anyhow!("VPN server error: {}", e))
 }
