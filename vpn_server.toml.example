@@ -145,9 +145,14 @@ secret_file = "./vpn-server.key"
 # Relay and Discovery (Optional)
 # ============================================================================
 
-# Custom relay server URL(s). This only changes which relay map iroh uses for
-# the transport path; the server uses a single endpoint with its usual relay
-# failover. A client's relay list must include the relay the server is homed on.
+# Custom relay server URLs: at least two distinct relays. The server rides out
+# a relay outage by moving onto another configured relay in place (same node
+# id, nothing torn down), so a single custom relay is rejected at startup.
+# Every relay is probed at startup; startup fails only when none comes online,
+# and a relay that does not is named in a warning, left out of the relay map,
+# and put back once it is connectable again. Clients must be configured with
+# this same full list: with custom relays they reach the server only through
+# the relay it is currently homed on.
 # relay_urls = [
 #     "https://relay1.example.com",
 #     "https://relay2.example.com",
@@ -160,11 +165,15 @@ secret_file = "./vpn-server.key"
 # private relay must present the same token.
 # relay_auth_token = "your-shared-relay-token"
 #
-# iroh address lookup (pkarr publishing + DNS lookup via n0's dns.iroh.link,
-# https://docs.iroh.computer/concepts/address-lookup) is always used — for both
-# the default relays and custom relays — so a client resolves the server's home
-# relay by endpoint ID. It is NOT configurable and is NOT real/VPN DNS. See
-# "Relays and Address Lookup" in docs/Architecture.md for the full design.
+# Whether iroh address lookup (pkarr publishing + DNS lookup via n0's
+# dns.iroh.link, https://docs.iroh.computer/concepts/address-lookup) runs
+# follows the relay choice and is not separately configurable: ON with the
+# default relays, so clients resolve the server's home relay by endpoint ID;
+# OFF with custom relays, so nothing is published to or resolved from public
+# iroh infrastructure and clients reach the server through the relay URLs
+# they attach as dial hints. It is NOT real/VPN DNS. See "Relay and Address
+# Lookup" in README.md and https://github.com/flexaccessdev/iroh-common-architecture
+# for the full design.
 
 # NOTE: There is no [iroh.transport] section. QUIC transport settings are
 # fixed constants on both ends: BBRv3 congestion control, 8 MB receive/send
