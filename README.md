@@ -722,12 +722,12 @@ the same IP during reconnects. Reassignment is expected mainly after server
 restart or allocation state changes.
 
 A **server** with custom relays watches its own home-relay registration: if it
-has no connected home relay for 60s it re-checks the network, and if that has
-not helped by 180s it rebuilds its endpoint in place (same node id) — the
-in-process equivalent of a restart, so relay-only clients (the mobile apps,
-anything off the LAN) are not stranded with connect timeouts until someone
-restarts the service. See
-[`docs/Architecture.md`](docs/Architecture.md#relay-watchdog-server-custom-relays).
+has no connected home relay for 60s and iroh has not re-homed it on its own,
+it takes the wedged relay out of its relay map and homes on another configured
+relay in place — same node id, same sockets, nothing torn down — so clients off
+the LAN (the mobile apps) are not stranded with connect timeouts until someone
+restarts the service. The relay is put back once it is connectable again. See
+[`docs/Architecture.md`](docs/Architecture.md#relay-failover-server-custom-relays).
 
 ## Relay and Address Lookup
 
@@ -751,10 +751,16 @@ The short version as it applies to `ezvpn`:
   attaches to the connection as dial hints. These are **required** for
   connectivity in that mode — with lookup off there is no published record to
   fall back on — so configure both sides with the full relay list.
-- Every configured custom relay is probed individually at startup and **all**
-  must come online, so a dead backup relay fails startup instead of hiding until
-  you need it. `relay_auth_token` (custom relays only) is validated by the same
-  probe.
+- A custom relay set is **at least two distinct relays**: the server rides out
+  a relay outage by moving onto another configured relay, so one relay is
+  rejected at startup.
+- Every configured custom relay is probed individually at startup. Startup
+  fails only when **none** comes online; a relay that does not is named in a
+  warning and left out of the relay map, so a relay that answers probes but
+  refuses connections cannot keep the process from ever coming online. The
+  server's failover puts it back once it is connectable; a client keeps it out
+  for its session. `relay_auth_token` (custom relays only) is validated by the
+  same probe.
 
 iroh address lookup is endpoint-ID resolution, not real/VPN DNS: it does not
 affect client DNS resolution, and the client does not push DNS or match domains

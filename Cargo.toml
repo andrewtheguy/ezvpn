@@ -34,7 +34,7 @@ ipnet = { version = "2", features = ["serde"] }
 # Shared iroh transport layer (RelayConfig + per-relay probe, endpoint
 # build/rebuild, home-relay watchdog, endpoint-bound auth transcript). No
 # `mdns` feature: ezvpn runs no local-network discovery.
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.3" }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.8" }
 # Redirected to the fork below via `[patch.crates-io]`, which also covers the
 # shared crate's own `iroh` dependency so the graph holds a single `iroh`.
 iroh = "1.1.0"

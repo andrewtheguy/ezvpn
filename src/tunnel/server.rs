@@ -17,8 +17,8 @@ use crate::runtime::{LockRole, VpnLock};
 use crate::tunnel::offload::VirtioNetHdr;
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
 use crate::transport::SERVER_ADDR_PUBLISH_INTERVAL;
-use crate::transport::endpoint::EndpointFactory;
-use flexaccess_iroh::relay_watchdog::{self, RelayOutage};
+use crate::transport::endpoint::RelayConfig;
+use flexaccess_iroh::relay_failover::fail_over_home_relay;
 use crate::tunnel::signaling::{
     ClientAuthPayload, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse,
     read_message, write_message,
@@ -28,15 +28,15 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointId, Watcher};
+use iroh::{Endpoint, EndpointId, RelayUrl, Watcher};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::io::ReadBuf;
-use tokio::sync::{RwLock, mpsc, oneshot, watch};
+use tokio::sync::{RwLock, mpsc, oneshot};
 
 /// Maximum number of frames drained from a channel per batch.
 const WRITE_BATCH_SIZE: usize = 256;
@@ -756,24 +756,20 @@ impl VpnServer {
 
     /// Run the VPN server, accepting connections via iroh.
     ///
-    /// `rebuild`, when given, arms the home-relay watchdog
-    /// (`flexaccess_iroh::relay_watchdog`): if the endpoint loses its home relay for
-    /// good, the wedged endpoint is closed and `rebuild` binds its replacement
-    /// (same identity), which the server then serves on. Pass `None` for the
-    /// default relays, where reachability does not hang on one relay
-    /// registration.
+    /// With custom relays the shared home-relay failover
+    /// (`flexaccess_iroh::relay_failover`) runs alongside the accept loop and
+    /// keeps the server dialable: `relay_config` is what it moves between, and
+    /// `relays_left_out` are the configured relays the endpoint was bound
+    /// without because they failed the startup probe, which it puts back once
+    /// they are connectable. With the default relays it is pending forever.
     pub async fn run(
         mut self,
         endpoint: Endpoint,
-        rebuild: Option<EndpointFactory>,
+        relay_config: &RelayConfig,
+        relays_left_out: &[RelayUrl],
     ) -> VpnResult<()> {
         // Setup TUN device
         self.setup_tun().await?;
-
-        // The live endpoint. Swapped by the relay watchdog's rebuild; the TUN
-        // reader (its self-encapsulation filter) and the status socket follow
-        // it through the receiver.
-        let (endpoint_tx, endpoint_rx) = watch::channel(endpoint.clone());
 
         log::info!("VPN Server started:");
         // Log IPv4 info if configured
@@ -873,12 +869,12 @@ impl VpnServer {
         let started_at = Instant::now();
         let node_id = endpoint.id().to_string();
         let status_server = server.clone();
-        let status_endpoint_rx = endpoint_rx.clone();
+        let status_endpoint = endpoint.clone();
         let status_overlay_v4 = server.config.network;
         let status_overlay_v6 = server.config.network6;
         let _status_listener =
             crate::control::spawn_status_listener(LockRole::Server, "default", move || {
-                let status_endpoint = status_endpoint_rx.borrow().clone();
+                let status_endpoint = status_endpoint.clone();
                 let status_server = status_server.clone();
                 let node_id = node_id.clone();
                 async move {
@@ -906,78 +902,29 @@ impl VpnServer {
         // Spawn TUN reader task (reads from TUN, routes to clients)
         // Store JoinHandle for graceful shutdown.
         let server_tun = server.clone();
+        let tun_endpoint = endpoint.clone();
         let tun_reader_handle = tokio::spawn(async move {
-            if let Err(e) = server_tun.run_tun_reader(tun_reader, endpoint_rx).await {
+            if let Err(e) = server_tun.run_tun_reader(tun_reader, &tun_endpoint).await {
                 log::error!("TUN reader error: {}", e);
             }
         });
 
-        // Serve loop. A pass accepts on the current endpoint until it closes,
-        // or — custom relays only — until the relay watchdog reports the
-        // endpoint has lost its home relay for good. That last case is the
-        // in-process equivalent of the process restart known to fix it: close
-        // the wedged endpoint, bind a fresh one with the same identity, and
-        // serve again. The TUN device, address pools, and client registries
-        // carry over; the old endpoint's connections (and their handler
-        // tasks) end with it, and those clients reconnect on their own.
-        //
-        // A rebuild only helps when iroh's relay bookkeeping went stale. When
-        // the relay itself is unreachable the fresh endpoint never registers
-        // either, and rebuilding it again every few minutes would keep
-        // dropping the LAN clients that still work. So consecutive endpoints
-        // that never saw a home relay lengthen the watchdog's deadline
-        // (`rebuild_deadline`); one that did register resets the escalation.
-        let mut endpoint = endpoint;
-        let mut unregistered_endpoints: u32 = 0;
-        loop {
-            let deadline = rebuild_deadline(unregistered_endpoints);
-            let outage = tokio::select! {
-                () = server.accept_loop(&endpoint, &tun_write_tx) => {
-                    log::info!("Endpoint closed, shutting down");
-                    break;
-                }
-                outage = watch_home_relay_if(rebuild.as_ref(), &endpoint, deadline) => outage,
-            };
-            let rebuild = rebuild
-                .as_ref()
-                .expect("watchdog only runs with a rebuild recipe");
-
-            unregistered_endpoints = if outage.relay_seen {
-                0
-            } else {
-                unregistered_endpoints + 1
-            };
-            log::error!(
-                "No connected home relay for {:.0}s despite a network re-check; rebuilding the \
-                 endpoint from scratch (server node id stays {})",
-                outage.duration.as_secs_f64(),
-                endpoint.id()
-            );
-            if unregistered_endpoints > 0 {
-                log::error!(
-                    "{unregistered_endpoints} endpoint(s) in a row never registered on any home \
-                     relay; the relay itself is probably unreachable. If the rebuilt endpoint \
-                     does not register either, the next rebuild waits {}s",
-                    rebuild_deadline(unregistered_endpoints).as_secs()
-                );
+        // Accept until the endpoint closes. Alongside, with custom relays, the
+        // shared home-relay failover keeps the server dialable: a custom-relay
+        // server is reachable from off the LAN only through its home relay (n0
+        // address lookup is off, clients dial by relay hint), and if that
+        // relay is lost for a minute without iroh re-homing on its own, the
+        // failover moves the endpoint onto another configured relay in place.
+        // Nothing is torn down: the identity, the direct paths, the
+        // established connections and the TUN device all stay. Relays the
+        // startup probe could not connect (the endpoint was bound without
+        // them) are put back by the same failover once they are. With the
+        // default relays the failover future is pending forever.
+        tokio::select! {
+            () = server.accept_loop(&endpoint, &tun_write_tx) => {
+                log::info!("Endpoint closed, shutting down");
             }
-            close_endpoint_bounded(endpoint).await;
-            endpoint = loop {
-                match rebuild().await {
-                    Ok(fresh) => break fresh,
-                    Err(e) => {
-                        log::error!(
-                            "Endpoint rebuild failed: {e:#}; retrying in {}s",
-                            REBUILD_RETRY.as_secs()
-                        );
-                        tokio::time::sleep(REBUILD_RETRY).await;
-                    }
-                }
-            };
-            // `send` fails only when every receiver is gone; the TUN reader
-            // holds one for the life of `run`.
-            let _ = endpoint_tx.send(endpoint.clone());
-            log::warn!("Endpoint rebuilt; serving again as {}", endpoint.id());
+            () = fail_over_home_relay(&endpoint, relay_config, relays_left_out) => {}
         }
 
         // Graceful shutdown: drop channel sender to signal TUN writer to exit,
@@ -1790,17 +1737,17 @@ impl VpnServer {
     /// super-frames are software-segmented into per-MSS datagrams). Software GRO
     /// coalescing is gone: a datagram can only carry a single MTU-sized packet.
     ///
-    /// `endpoint_rx` carries the live endpoint; its local UDP port set (the
-    /// self-encapsulation filter) is re-read whenever the relay watchdog
-    /// rebuilds the endpoint, which binds fresh sockets on fresh ports.
+    /// `endpoint`'s local UDP port set is the self-encapsulation filter; the
+    /// endpoint is bound once for the life of `run` (a relay failover moves
+    /// its home relay, not its sockets), so the set is read once.
     async fn run_tun_reader(
         &self,
         mut tun_reader: crate::net::device::TunReader,
-        mut endpoint_rx: watch::Receiver<Endpoint>,
+        endpoint: &Endpoint,
     ) -> VpnResult<()> {
         log::info!("TUN reader started");
 
-        let mut local_iroh_udp_ports = collect_local_iroh_udp_ports(&endpoint_rx.borrow_and_update());
+        let local_iroh_udp_ports = collect_local_iroh_udp_ports(endpoint);
 
         let buffer_size = tun_reader.buffer_size();
         let mut read_storage = uninitialized_vec(buffer_size);
@@ -1828,18 +1775,6 @@ impl VpnServer {
 
             let raw_frame = packet_buf.filled();
             self.stats.tun_packets_read.fetch_add(1, Ordering::Relaxed);
-
-            // One atomic load per packet; the set itself is only rebuilt when
-            // the endpoint was. `Err` means the sender is gone (`run` is
-            // ending), which changes nothing here.
-            if endpoint_rx.has_changed().unwrap_or(false) {
-                local_iroh_udp_ports =
-                    collect_local_iroh_udp_ports(&endpoint_rx.borrow_and_update());
-                log::info!(
-                    "Filtering tunneled traffic for {} local iroh UDP port(s) of the rebuilt endpoint",
-                    local_iroh_udp_ports.len()
-                );
-            }
 
             let (offload, packet_ref) = match tun_reader.split_frame(raw_frame) {
                 Ok(parts) => parts,
@@ -2044,61 +1979,6 @@ fn collect_local_iroh_udp_ports(endpoint: &Endpoint) -> HashSet<u16> {
     endpoint.addr().ip_addrs().map(|addr| addr.port()).collect()
 }
 
-/// Pause between attempts to bind a replacement endpoint after the relay
-/// watchdog retired the old one and the rebuild itself failed (e.g. no route
-/// to bind on). The server has no endpoint at all during this wait, so it is
-/// short — there is nothing to lose by trying again soon.
-const REBUILD_RETRY: Duration = Duration::from_secs(30);
-
-/// Cap on the watchdog's rebuild deadline once consecutive rebuilt endpoints
-/// keep failing to register on any home relay.
-const REBUILD_DEADLINE_MAX: Duration = Duration::from_secs(30 * 60);
-
-/// The watchdog's rebuild deadline for the next serve pass, given how many
-/// endpoints in a row never registered on a home relay: the usual
-/// [`relay_watchdog::RELAY_OUTAGE_REBUILD`] after an endpoint that did
-/// register, doubling per unregistered endpoint up to [`REBUILD_DEADLINE_MAX`]
-/// (180s, 6m, 12m, 24m, 30m). Rebuilding while the relay itself is down
-/// gains nothing and drops every LAN client, so it is done less and less
-/// often; a relay that comes back resets the escalation.
-fn rebuild_deadline(unregistered_endpoints: u32) -> Duration {
-    let factor = 1u32 << unregistered_endpoints.min(4);
-    (relay_watchdog::RELAY_OUTAGE_REBUILD * factor).min(REBUILD_DEADLINE_MAX)
-}
-
-/// Bound wait on the old endpoint's graceful close during a rebuild. The close
-/// runs as its own task and is never cancelled (dropping a bound endpoint
-/// without `close()` is fatal under the release profile's panic=abort); the
-/// bound only keeps the serve loop from stalling behind it, letting a slow
-/// close finish in the background while the replacement is bound.
-const REBUILD_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The relay watchdog for one serve pass: pending forever when no rebuild
-/// recipe was given (default relays), otherwise resolves once the endpoint
-/// has had no home relay for `rebuild_after` and should be replaced.
-async fn watch_home_relay_if(
-    rebuild: Option<&EndpointFactory>,
-    endpoint: &Endpoint,
-    rebuild_after: Duration,
-) -> RelayOutage {
-    match rebuild {
-        Some(_) => relay_watchdog::watch_home_relay(endpoint, rebuild_after).await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Close a retired endpoint, waiting at most [`REBUILD_CLOSE_TIMEOUT`] for it;
-/// a slower close carries on in its own task.
-async fn close_endpoint_bounded(endpoint: Endpoint) {
-    let close = tokio::spawn(async move { endpoint.close().await });
-    if tokio::time::timeout(REBUILD_CLOSE_TIMEOUT, close).await.is_err() {
-        log::warn!(
-            "Old endpoint is taking more than {}s to close; continuing in the background",
-            REBUILD_CLOSE_TIMEOUT.as_secs()
-        );
-    }
-}
-
 /// The server's candidate iroh underlay addresses (deduped, sorted): the set it
 /// advertises to clients for bypass routing, in the handshake and over the data
 /// path. Shared by the handshake response, the periodic publisher, and `status`.
@@ -2291,17 +2171,6 @@ fn extract_udp_ports(packet: &[u8]) -> Option<(u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rebuild_deadline_doubles_per_unregistered_endpoint_up_to_the_cap() {
-        let base = relay_watchdog::RELAY_OUTAGE_REBUILD;
-        assert_eq!(rebuild_deadline(0), base);
-        assert_eq!(rebuild_deadline(1), base * 2);
-        assert_eq!(rebuild_deadline(2), base * 4);
-        assert_eq!(rebuild_deadline(3), base * 8);
-        assert_eq!(rebuild_deadline(4), REBUILD_DEADLINE_MAX);
-        assert_eq!(rebuild_deadline(50), REBUILD_DEADLINE_MAX);
-    }
 
     /// Helper to create a random EndpointId for testing
     fn random_endpoint_id() -> EndpointId {
